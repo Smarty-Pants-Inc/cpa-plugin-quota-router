@@ -71,7 +71,7 @@ func (r *pluginRuntime) applyConfig(cfg pluginConfig) {
 		r.wake, r.cancel, r.done = wake, cancel, done
 		go r.refreshLoop(ctx, wake, done)
 		r.queueAllRefreshLocked()
-		r.log("info", "anthropic router refresh worker started", map[string]any{
+		r.log("info", "quota router refresh worker started", map[string]any{
 			"cutoff_percent_used": cfg.CutoffPercentUsed,
 			"protected_models":    cfg.ProtectedModels,
 			"minimum_refresh_age": cfg.PollInterval.String(),
@@ -82,7 +82,7 @@ func (r *pluginRuntime) applyConfig(cfg pluginConfig) {
 	if r.cache.empty() {
 		r.queueAllRefreshLocked()
 	}
-	r.log("info", "anthropic router configuration reloaded", map[string]any{
+	r.log("info", "quota router configuration reloaded", map[string]any{
 		"cutoff_percent_used": cfg.CutoffPercentUsed,
 		"protected_models":    cfg.ProtectedModels,
 		"minimum_refresh_age": cfg.PollInterval.String(),
@@ -114,7 +114,7 @@ func (r *pluginRuntime) stopLocked() {
 	clear(r.pendingIDs)
 	clear(r.inFlightIDs)
 	r.refreshMu.Unlock()
-	r.log("info", "anthropic router refresh worker stopped", nil)
+	r.log("info", "quota router refresh worker stopped", nil)
 }
 
 func (r *pluginRuntime) loadedConfig() pluginConfig {
@@ -251,7 +251,7 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 	}
 	entries, err := r.host.listAuth()
 	if err != nil {
-		r.log("warn", "anthropic router auth discovery failed", map[string]any{"category": "auth_list"})
+		r.log("warn", "quota router auth discovery failed", map[string]any{"category": "auth_list"})
 		return
 	}
 	auths := physicalClaudeAuths(entries)
@@ -294,7 +294,7 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 		return
 	}
 	r.cache.recordSuccess(auth.ID, result.WeeklyPercentUsed, result.ResetAt, r.now())
-	r.log("debug", "anthropic router quota refreshed", map[string]any{
+	r.log("debug", "quota router quota refreshed", map[string]any{
 		"auth_id":             auth.ID,
 		"weekly_percent_used": result.WeeklyPercentUsed,
 		"blocked":             result.WeeklyPercentUsed >= cfg.CutoffPercentUsed,
@@ -303,7 +303,7 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 
 func (r *pluginRuntime) recordPollFailure(authID, category string) {
 	r.cache.recordFailure(authID, category)
-	r.log("warn", "anthropic router quota refresh failed", map[string]any{
+	r.log("warn", "quota router quota refresh failed", map[string]any{
 		"auth_id":  authID,
 		"category": category,
 	})

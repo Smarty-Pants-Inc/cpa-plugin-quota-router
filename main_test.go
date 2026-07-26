@@ -1126,7 +1126,7 @@ func TestConfigValidationAndRegistrationMetadata(t *testing.T) {
 	if registration.Metadata.Name != pluginName ||
 		registration.Metadata.Version != pluginVersion ||
 		registration.Metadata.Author != "Smarty Pants Inc" ||
-		registration.Metadata.GitHubRepository != "https://github.com/Smarty-Pants-Inc/cliproxyapi-anthropic-router" ||
+		registration.Metadata.GitHubRepository != "https://github.com/Smarty-Pants-Inc/cpa-plugin-quota-router" ||
 		!registration.Capabilities.Scheduler || !registration.Capabilities.ManagementAPI {
 		t.Fatalf("registration = %#v", registration)
 	}

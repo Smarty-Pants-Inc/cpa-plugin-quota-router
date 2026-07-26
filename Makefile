@@ -1,5 +1,5 @@
-PLUGIN_NAME ?= cliproxyapi-anthropic-router
-VERSION ?= 0.4.0
+PLUGIN_NAME ?= quota-router
+VERSION ?= 0.5.0
 BUILD_DIR ?= dist
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)

@@ -153,7 +153,7 @@ func pluginRegistration() registration {
 			Name:             pluginName,
 			Version:          pluginVersion,
 			Author:           "Smarty Pants Inc",
-			GitHubRepository: "https://github.com/Smarty-Pants-Inc/cliproxyapi-anthropic-router",
+			GitHubRepository: "https://github.com/Smarty-Pants-Inc/cpa-plugin-quota-router",
 			ConfigFields: []pluginapi.ConfigField{
 				{
 					Name:        "protected-models",

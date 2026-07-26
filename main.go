@@ -3,7 +3,7 @@ package main
 import "time"
 
 const (
-	pluginName               = "cliproxyapi-anthropic-router"
+	pluginName               = "quota-router"
 	defaultCutoffPercentUsed = 50.0
 	defaultProtectedModel    = "claude-fable-5"
 	defaultPollInterval      = 5 * time.Minute
@@ -11,8 +11,8 @@ const (
 	defaultUsageEndpoint     = "https://api.anthropic.com/api/oauth/usage"
 	anthropicOAuthBeta       = "oauth-2025-04-20"
 	maxUsageResponseBytes    = 64 << 10
-	exhaustedErrorCode       = "anthropic_router_exhausted"
-	managementStatusRoute    = "/plugins/cliproxyapi-anthropic-router/status"
+	exhaustedErrorCode       = "quota_router_exhausted"
+	managementStatusRoute    = "/plugins/quota-router/status"
 	managementStatusFullPath = "/v0/management" + managementStatusRoute
 	pollErrorAuthGet         = "auth_get"
 	pollErrorMissingToken    = "missing_token"
@@ -30,7 +30,7 @@ const (
 	pollErrorRead            = "read_error"
 )
 
-var pluginVersion = "0.4.0"
+var pluginVersion = "0.5.0"
 
 // Variable only so the C-shared integration test can inject a local fixture.
 var usageEndpoint = defaultUsageEndpoint

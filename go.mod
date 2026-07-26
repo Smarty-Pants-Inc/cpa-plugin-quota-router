@@ -1,4 +1,4 @@
-module github.com/Smarty-Pants-Inc/cliproxyapi-anthropic-router
+module github.com/Smarty-Pants-Inc/cpa-plugin-quota-router
 
 go 1.26.0
 

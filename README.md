@@ -1,18 +1,18 @@
-# CLIProxyAPI Anthropic Router
+# CLIProxyAPI Quota Router
 
-Quota-aware Anthropic account routing for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). The plugin pauses configured protected models on an OAuth account when Anthropic's seven-day utilization reaches a cutoff, while leaving other models on CLIProxyAPI's native scheduler.
+Quota-aware account routing for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). The plugin routes configured protected models away from OAuth accounts when provider usage reaches a configurable cutoff, while leaving other models on CLIProxyAPI's native scheduler. This release supports Anthropic's seven-day usage quota; the provider-specific usage adapter can expand when another provider exposes equivalent data.
 
 The default specifically protects `claude-fable-5` at 50%. This matches Anthropic's [June 30 redeployment announcement](https://www.anthropic.com/news/redeploying-fable-5), which included Fable 5 for up to 50% of weekly usage through July 7, 2026; Anthropic said access would use usage credits afterward, so both the model and cutoff remain configurable.
 
 ## Install
 
-Download the archive for your platform from [Releases](https://github.com/Smarty-Pants-Inc/cliproxyapi-anthropic-router/releases), extract the library into CLIProxyAPI's plugin directory, and configure it by plugin ID:
+Download the archive for your platform from [Releases](https://github.com/Smarty-Pants-Inc/cpa-plugin-quota-router/releases), extract the library into CLIProxyAPI's plugin directory, and configure it by plugin ID:
 
 ```yaml
 plugins:
   enabled: true
   configs:
-    cliproxyapi-anthropic-router:
+    quota-router:
       enabled: true
       priority: 100
       protected-models: [claude-fable-5]
@@ -21,7 +21,7 @@ plugins:
       request-timeout: 10s
 ```
 
-The library basename must be `cliproxyapi-anthropic-router` with `.dylib`, `.so`, or `.dll` for the host platform.
+The library basename must be `quota-router` with `.dylib`, `.so`, or `.dll` for the host platform.
 
 `poll-interval` is the minimum cached-usage age before another refresh, not a continuous polling timer.
 
@@ -34,7 +34,7 @@ The library basename must be `cliproxyapi-anthropic-router` with `.dylib`, `.so`
 - Applies only to exact, case-insensitive `protected-models` matches.
 - Blocks an account at or above `cutoff-percent-used`; unknown or reset-expired quota state fails open while a refresh is queued.
 - Never changes auth files or CLIProxyAPI's permanent disabled state.
-- Exposes authenticated status at `GET /v0/management/plugins/cliproxyapi-anthropic-router/status`.
+- Exposes authenticated status at `GET /v0/management/plugins/quota-router/status`.
 
 ## Build and test
 

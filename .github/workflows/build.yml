@@ -11,7 +11,7 @@ permissions:
   contents: write
 
 env:
-  PLUGIN_NAME: cliproxyapi-anthropic-router
+  PLUGIN_NAME: quota-router
 
 jobs:
   test:

@@ -120,7 +120,7 @@ plugins:
   enabled: true
   dir: %q
   configs:
-    cliproxyapi-anthropic-router:
+    quota-router:
       enabled: true
       priority: 100
       protected-models: [claude-fable-5]
