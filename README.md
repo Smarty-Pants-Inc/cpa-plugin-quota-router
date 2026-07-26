@@ -2,7 +2,7 @@
 
 Quota-aware Anthropic account routing for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). The plugin pauses configured protected models on an OAuth account when Anthropic's seven-day utilization reaches a cutoff, while leaving other models on CLIProxyAPI's native scheduler.
 
-Created and published by [Smarty Pants Inc](https://github.com/Smarty-Pants-Inc). MIT licensed.
+The default specifically protects `claude-fable-5` at 50%. This matches Anthropic's [June 30 redeployment announcement](https://www.anthropic.com/news/redeploying-fable-5), which included Fable 5 for up to 50% of weekly usage through July 7, 2026; Anthropic said access would use usage credits afterward, so both the model and cutoff remain configurable.
 
 ## Install
 
@@ -25,7 +25,8 @@ The library basename must be `cliproxyapi-anthropic-router` with `.dylib`, `.so`
 
 ## Behavior
 
-- Polls enabled physical Claude OAuth credentials in one background worker.
+- Refreshes Anthropic's seven-day usage once per enabled physical Claude OAuth credential on the configured interval; request routing itself reads only the in-memory snapshot.
+- A rejection-only design cannot enforce a pre-exhaustion cutoff: the rejection arrives only after the hard limit is reached.
 - Applies only to exact, case-insensitive `protected-models` matches.
 - Blocks an account at or above `cutoff-percent-used`; unknown or stale quota state fails open.
 - Never changes auth files or CLIProxyAPI's permanent disabled state.
@@ -41,3 +42,5 @@ make build
 ```
 
 Release tags matching `v*` build store-compatible archives and `checksums.txt` through GitHub Actions.
+
+Created and published by [Smarty Pants Inc](https://github.com/Smarty-Pants-Inc). MIT licensed.
