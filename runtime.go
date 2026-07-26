@@ -65,7 +65,7 @@ func (r *pluginRuntime) applyConfig(cfg pluginConfig) {
 		done := make(chan struct{})
 		r.wake, r.cancel, r.done = wake, cancel, done
 		go r.pollLoop(ctx, wake, done)
-		r.log("info", "claude weekly cutoff poller started", map[string]any{
+		r.log("info", "anthropic router poller started", map[string]any{
 			"cutoff_percent_used": cfg.CutoffPercentUsed,
 			"protected_models":    cfg.ProtectedModels,
 			"poll_interval":       cfg.PollInterval.String(),
@@ -77,7 +77,7 @@ func (r *pluginRuntime) applyConfig(cfg pluginConfig) {
 	case r.wake <- struct{}{}:
 	default:
 	}
-	r.log("info", "claude weekly cutoff configuration reloaded", map[string]any{
+	r.log("info", "anthropic router configuration reloaded", map[string]any{
 		"cutoff_percent_used": cfg.CutoffPercentUsed,
 		"protected_models":    cfg.ProtectedModels,
 		"poll_interval":       cfg.PollInterval.String(),
@@ -104,7 +104,7 @@ func (r *pluginRuntime) stopLocked() {
 	if done != nil {
 		<-done
 	}
-	r.log("info", "claude weekly cutoff poller stopped", nil)
+	r.log("info", "anthropic router poller stopped", nil)
 }
 
 func (r *pluginRuntime) loadedConfig() pluginConfig {
@@ -162,7 +162,7 @@ func (r *pluginRuntime) pollOnce(ctx context.Context, cfg pluginConfig) {
 	}
 	entries, err := r.host.listAuth()
 	if err != nil {
-		r.log("warn", "claude weekly cutoff auth discovery failed", map[string]any{"category": "auth_list"})
+		r.log("warn", "anthropic router auth discovery failed", map[string]any{"category": "auth_list"})
 		return
 	}
 	auths := physicalClaudeAuths(entries)
@@ -199,7 +199,7 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 		return
 	}
 	r.cache.recordSuccess(auth.ID, result.WeeklyPercentUsed, result.ResetAt, r.now())
-	r.log("debug", "claude weekly cutoff quota refreshed", map[string]any{
+	r.log("debug", "anthropic router quota refreshed", map[string]any{
 		"auth_id":             auth.ID,
 		"weekly_percent_used": result.WeeklyPercentUsed,
 		"blocked":             result.WeeklyPercentUsed >= cfg.CutoffPercentUsed,
@@ -208,7 +208,7 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 
 func (r *pluginRuntime) recordPollFailure(authID, category string) {
 	r.cache.recordFailure(authID, category)
-	r.log("warn", "claude weekly cutoff quota refresh failed", map[string]any{
+	r.log("warn", "anthropic router quota refresh failed", map[string]any{
 		"auth_id":  authID,
 		"category": category,
 	})

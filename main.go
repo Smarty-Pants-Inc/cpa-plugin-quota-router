@@ -30,7 +30,7 @@ const (
 	pollErrorRead            = "read_error"
 )
 
-var pluginVersion = "0.3.0"
+var pluginVersion = "0.3.1"
 
 // Variable only so the C-shared integration test can inject a local fixture.
 var usageEndpoint = defaultUsageEndpoint
