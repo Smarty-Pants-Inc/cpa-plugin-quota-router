@@ -23,7 +23,18 @@ plugins:
 
 The library basename must be `quota-router` with `.dylib`, `.so`, or `.dll` for the host platform.
 
+Published releases include Darwin (`amd64`, `arm64`), Linux (`amd64`, `arm64`), and Windows (`amd64`) builds.
+
 `poll-interval` is the minimum cached-usage age before another refresh, not a continuous polling timer.
+
+## Configuration
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `protected-models` | `[claude-fable-5]` | Exact, case-insensitive model IDs governed by the cutoff. |
+| `cutoff-percent-used` | `50` | Blocks an eligible account at or above this seven-day utilization percentage. |
+| `poll-interval` | `5m` | Minimum cache age before a protected request queues another asynchronous refresh. |
+| `request-timeout` | `10s` | Timeout for the provider usage request, expressed as a Go duration. |
 
 ## Behavior
 
@@ -36,12 +47,21 @@ The library basename must be `quota-router` with `.dylib`, `.so`, or `.dll` for 
 - Never changes auth files or CLIProxyAPI's permanent disabled state.
 - Exposes authenticated status at `GET /v0/management/plugins/quota-router/status`.
 
+## Security
+
+- Reads eligible Claude credentials through CLIProxyAPI's host API and never writes auth files.
+- Sends the access token only to Anthropic's fixed HTTPS usage endpoint and refuses redirects.
+- Never logs access tokens, refresh tokens, or provider response bodies.
+- Exposes status only through CLIProxyAPI's authenticated Management API.
+
 ## Build and test
 
 Requires Go 1.26 and CLIProxyAPI v7.2.100 or newer.
 
 ```bash
 make test
+make test-race
+make vet
 make build
 ```
 
