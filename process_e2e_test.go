@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -24,8 +25,11 @@ const (
 	e2eManagementKey = "e2e-management-key"
 )
 
+var e2eUsageHits atomic.Int64
+
 func TestCLIProxyAPIProcessEndToEnd(t *testing.T) {
 	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		e2eUsageHits.Add(1)
 		if r.Header.Get("anthropic-beta") != anthropicOAuthBeta {
 			http.Error(w, "missing beta header", http.StatusBadRequest)
 			return
@@ -177,6 +181,11 @@ plugins:
 	if len(status.Accounts) != 2 {
 		t.Fatalf("initial status = %#v", status)
 	}
+	startupUsageHits := e2eUsageHits.Load()
+	time.Sleep(250 * time.Millisecond)
+	if hits := e2eUsageHits.Load(); hits != startupUsageHits {
+		t.Fatalf("idle worker refreshed usage: hits=%d, want %d", hits, startupUsageHits)
+	}
 	waitForProcessModel(t, client, baseURL, processDone, &processErr, logPath, "claude-sonnet-4-6")
 
 	unprotectedResponse := postClaudeMessage(t, client, baseURL, "claude-sonnet-4-6")
@@ -200,6 +209,9 @@ drainProxyHits:
 			break drainProxyHits
 		}
 	}
+	if hits := e2eUsageHits.Load(); hits != startupUsageHits {
+		t.Fatalf("unprotected request refreshed usage: hits=%d, want %d", hits, startupUsageHits)
+	}
 	waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status cutoffStatusResponse) bool {
 		if len(status.Accounts) != 2 {
 			return false
@@ -220,6 +232,9 @@ drainProxyHits:
 	case hit := <-proxyHits:
 		t.Fatalf("protected request reached upstream proxy: %s", hit)
 	default:
+	}
+	if hits := e2eUsageHits.Load(); hits != startupUsageHits {
+		t.Fatalf("blocked request refreshed usage before reset: hits=%d, want %d", hits, startupUsageHits)
 	}
 
 	patch := []byte(`{"cutoff-percent-used":90}`)
@@ -262,6 +277,7 @@ drainProxyHits:
 	case <-time.After(3 * time.Second):
 		t.Fatalf("eligible request never reached upstream proxy: %s\nserver log:\n%s", eligibleResponse, readLog(logPath))
 	}
+	waitFor(t, func() bool { return e2eUsageHits.Load() > startupUsageHits })
 }
 
 func cliProxyAPIModuleDir(t *testing.T) string {

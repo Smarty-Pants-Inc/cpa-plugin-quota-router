@@ -33,6 +33,7 @@ type quotaSample struct {
 	HasSample         bool
 	WeeklyPercentUsed float64
 	SampledAt         time.Time
+	LastAttemptAt     time.Time
 	ResetAt           time.Time
 	LastErrorCategory string
 }
@@ -48,6 +49,12 @@ func (s quotaSample) blocked(now time.Time, cutoff float64) bool {
 type quotaCache struct {
 	mu      sync.Mutex
 	samples map[string]quotaSample
+}
+
+func (c *quotaCache) empty() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.samples) == 0
 }
 
 func (c *quotaCache) reconcile(auths []physicalClaudeAuth) {
@@ -75,6 +82,39 @@ func (c *quotaCache) reconcile(auths []physicalClaudeAuth) {
 	c.mu.Unlock()
 }
 
+func (c *quotaCache) claimRefresh(authID string, now time.Time, cutoff float64, minimumAge time.Duration) bool {
+	if strings.TrimSpace(authID) == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sample := c.samples[authID]
+	if sample.blocked(now, cutoff) {
+		return false
+	}
+	lastCheck := sample.SampledAt
+	if sample.LastAttemptAt.After(lastCheck) {
+		lastCheck = sample.LastAttemptAt
+	}
+	if !lastCheck.IsZero() && now.Before(lastCheck.Add(minimumAge)) {
+		return false
+	}
+	sample.LastAttemptAt = now
+	c.samples[authID] = sample
+	return true
+}
+
+func (c *quotaCache) recordAttempt(authID string, attemptedAt time.Time) {
+	if strings.TrimSpace(authID) == "" {
+		return
+	}
+	c.mu.Lock()
+	sample := c.samples[authID]
+	sample.LastAttemptAt = attemptedAt
+	c.samples[authID] = sample
+	c.mu.Unlock()
+}
+
 func (c *quotaCache) recordSuccess(authID string, percentUsed float64, resetAt, sampledAt time.Time) {
 	if strings.TrimSpace(authID) == "" {
 		return
@@ -84,6 +124,7 @@ func (c *quotaCache) recordSuccess(authID string, percentUsed float64, resetAt, 
 	sample.HasSample = true
 	sample.WeeklyPercentUsed = percentUsed
 	sample.SampledAt = sampledAt
+	sample.LastAttemptAt = sampledAt
 	sample.ResetAt = resetAt
 	sample.LastErrorCategory = ""
 	c.samples[authID] = sample

@@ -168,7 +168,7 @@ func pluginRegistration() registration {
 				{
 					Name:        "poll-interval",
 					Type:        pluginapi.ConfigFieldTypeString,
-					Description: "Background quota refresh interval as a Go duration. Default: 5m.",
+					Description: "Minimum cached-usage age before a protected-model request queues another refresh. Default: 5m.",
 				},
 				{
 					Name:        "request-timeout",

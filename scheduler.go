@@ -81,6 +81,7 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 		}
 	}
 	if selected != nil {
+		r.queueCandidateRefresh(selected.ID, cfg, now)
 		return pluginapi.SchedulerPickResponse{AuthID: selected.ID, Handled: true}, nil
 	}
 	if claudeCandidates > 0 && blockedCandidates == claudeCandidates {

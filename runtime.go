@@ -24,6 +24,7 @@ type claudeCredential struct {
 
 type pluginRuntime struct {
 	lifecycleMu sync.Mutex
+	refreshMu   sync.Mutex
 	config      atomic.Pointer[pluginConfig]
 	cache       quotaCache
 	host        hostClient
@@ -32,6 +33,10 @@ type pluginRuntime struct {
 	wake        chan struct{}
 	cancel      context.CancelFunc
 	done        chan struct{}
+	pendingAll  bool
+	pendingIDs  map[string]struct{}
+	inFlightAll bool
+	inFlightIDs map[string]struct{}
 }
 
 func newPluginRuntime(host hostClient, fetch usageFetcher, now func() time.Time) *pluginRuntime {
@@ -64,23 +69,23 @@ func (r *pluginRuntime) applyConfig(cfg pluginConfig) {
 		wake := make(chan struct{}, 1)
 		done := make(chan struct{})
 		r.wake, r.cancel, r.done = wake, cancel, done
-		go r.pollLoop(ctx, wake, done)
-		r.log("info", "anthropic router poller started", map[string]any{
+		go r.refreshLoop(ctx, wake, done)
+		r.queueAllRefreshLocked()
+		r.log("info", "anthropic router refresh worker started", map[string]any{
 			"cutoff_percent_used": cfg.CutoffPercentUsed,
 			"protected_models":    cfg.ProtectedModels,
-			"poll_interval":       cfg.PollInterval.String(),
+			"minimum_refresh_age": cfg.PollInterval.String(),
 			"request_timeout":     cfg.RequestTimeout.String(),
 		})
 		return
 	}
-	select {
-	case r.wake <- struct{}{}:
-	default:
+	if r.cache.empty() {
+		r.queueAllRefreshLocked()
 	}
 	r.log("info", "anthropic router configuration reloaded", map[string]any{
 		"cutoff_percent_used": cfg.CutoffPercentUsed,
 		"protected_models":    cfg.ProtectedModels,
-		"poll_interval":       cfg.PollInterval.String(),
+		"minimum_refresh_age": cfg.PollInterval.String(),
 		"request_timeout":     cfg.RequestTimeout.String(),
 	})
 }
@@ -99,12 +104,17 @@ func (r *pluginRuntime) stopLocked() {
 		return
 	}
 	cancel, done := r.cancel, r.done
-	r.wake, r.cancel, r.done = nil, nil, nil
 	cancel()
 	if done != nil {
 		<-done
 	}
-	r.log("info", "anthropic router poller stopped", nil)
+	r.wake, r.cancel, r.done = nil, nil, nil
+	r.refreshMu.Lock()
+	r.pendingAll, r.inFlightAll = false, false
+	clear(r.pendingIDs)
+	clear(r.inFlightIDs)
+	r.refreshMu.Unlock()
+	r.log("info", "anthropic router refresh worker stopped", nil)
 }
 
 func (r *pluginRuntime) loadedConfig() pluginConfig {
@@ -117,47 +127,126 @@ func (r *pluginRuntime) loadedConfig() pluginConfig {
 	return defaultPluginConfig()
 }
 
-func (r *pluginRuntime) pollLoop(ctx context.Context, wake <-chan struct{}, done chan<- struct{}) {
-	defer close(done)
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		cfg := r.loadedConfig()
-		if !cfg.Enabled {
-			return
-		}
-		r.pollOnce(ctx, cfg)
-		if ctx.Err() != nil {
-			return
-		}
-		timer := time.NewTimer(r.loadedConfig().PollInterval)
-		select {
-		case <-ctx.Done():
-			stopTimer(timer)
-			return
-		case <-wake:
-			stopTimer(timer)
-		case <-timer.C:
-		}
-	}
-}
-
-func stopTimer(timer *time.Timer) {
-	if timer == nil || timer.Stop() {
+func (r *pluginRuntime) queueAllRefreshLocked() {
+	if r.wake == nil {
 		return
 	}
+	r.refreshMu.Lock()
+	r.pendingAll = true
+	clear(r.pendingIDs)
+	wake := r.wake
+	r.refreshMu.Unlock()
 	select {
-	case <-timer.C:
+	case wake <- struct{}{}:
 	default:
 	}
 }
 
-func (r *pluginRuntime) pollOnce(ctx context.Context, cfg pluginConfig) {
-	if r == nil || r.host == nil || r.fetch == nil {
+func (r *pluginRuntime) queueCandidateRefresh(authID string, cfg pluginConfig, now time.Time) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
 		return
 	}
-	if ctx.Err() != nil {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.wake == nil || r.cancel == nil || !r.loadedConfig().Enabled {
+		return
+	}
+	r.refreshMu.Lock()
+	if r.pendingAll || r.inFlightAll {
+		r.refreshMu.Unlock()
+		return
+	}
+	if _, exists := r.pendingIDs[authID]; exists {
+		r.refreshMu.Unlock()
+		return
+	}
+	if _, exists := r.inFlightIDs[authID]; exists {
+		r.refreshMu.Unlock()
+		return
+	}
+	if !r.cache.claimRefresh(authID, now, cfg.CutoffPercentUsed, cfg.PollInterval) {
+		r.refreshMu.Unlock()
+		return
+	}
+	if r.pendingIDs == nil {
+		r.pendingIDs = make(map[string]struct{})
+	}
+	r.pendingIDs[authID] = struct{}{}
+	wake := r.wake
+	r.refreshMu.Unlock()
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
+}
+
+func (r *pluginRuntime) refreshLoop(ctx context.Context, wake <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-wake:
+		}
+		for {
+			all, authIDs := r.takePendingRefresh()
+			if !all && len(authIDs) == 0 {
+				break
+			}
+			cfg := r.loadedConfig()
+			if cfg.Enabled {
+				r.refreshAuths(ctx, cfg, all, authIDs)
+			}
+			r.finishRefresh(all, authIDs)
+			if ctx.Err() != nil {
+				return
+			}
+		}
+	}
+}
+
+func (r *pluginRuntime) takePendingRefresh() (bool, map[string]struct{}) {
+	r.refreshMu.Lock()
+	defer r.refreshMu.Unlock()
+	if r.pendingAll {
+		r.pendingAll = false
+		clear(r.pendingIDs)
+		r.inFlightAll = true
+		return true, nil
+	}
+	if len(r.pendingIDs) == 0 {
+		return false, nil
+	}
+	authIDs := r.pendingIDs
+	r.pendingIDs = make(map[string]struct{})
+	if r.inFlightIDs == nil {
+		r.inFlightIDs = make(map[string]struct{}, len(authIDs))
+	}
+	for authID := range authIDs {
+		r.inFlightIDs[authID] = struct{}{}
+	}
+	return false, authIDs
+}
+
+func (r *pluginRuntime) finishRefresh(all bool, authIDs map[string]struct{}) {
+	r.refreshMu.Lock()
+	defer r.refreshMu.Unlock()
+	if all {
+		r.inFlightAll = false
+		return
+	}
+	for authID := range authIDs {
+		delete(r.inFlightIDs, authID)
+	}
+}
+
+func (r *pluginRuntime) pollOnce(ctx context.Context, cfg pluginConfig) {
+	r.refreshAuths(ctx, cfg, true, nil)
+}
+
+func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all bool, authIDs map[string]struct{}) {
+	if r == nil || r.host == nil || r.fetch == nil || ctx.Err() != nil {
 		return
 	}
 	entries, err := r.host.listAuth()
@@ -171,11 +260,17 @@ func (r *pluginRuntime) pollOnce(ctx context.Context, cfg pluginConfig) {
 		if ctx.Err() != nil {
 			return
 		}
+		if !all {
+			if _, selected := authIDs[auth.ID]; !selected {
+				continue
+			}
+		}
 		r.pollAuth(ctx, auth, cfg)
 	}
 }
 
 func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig) {
+	r.cache.recordAttempt(auth.ID, r.now())
 	rawAuth, err := r.host.getAuth(auth.AuthIndex)
 	if err != nil {
 		r.recordPollFailure(auth.ID, pollErrorAuthGet)

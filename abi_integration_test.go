@@ -125,7 +125,11 @@ int main(int argc, char** argv) {
 	char reconfigure_method[] = "plugin.reconfigure";
 	CHECK(plugin.call(reconfigure_method, empty_config, 2, &response) == 0, 18);
 	free_plugin_response(&plugin, &response);
-	CHECK(wait_flag(&malformed_freed), 19);
+	char scheduler_method[] = "scheduler.pick";
+	uint8_t scheduler_request[] = "{\"Provider\":\"claude\",\"Providers\":[\"claude\"],\"Model\":\"claude-fable-5\",\"Candidates\":[{\"ID\":\"auth-a\",\"Provider\":\"claude\"}]}";
+	CHECK(plugin.call(scheduler_method, scheduler_request, sizeof(scheduler_request) - 1, &response) == 0, 19);
+	free_plugin_response(&plugin, &response);
+	CHECK(wait_flag(&malformed_freed), 20);
 
 	plugin.shutdown();
 	dlclose(library);

@@ -23,12 +23,16 @@ plugins:
 
 The library basename must be `cliproxyapi-anthropic-router` with `.dylib`, `.so`, or `.dll` for the host platform.
 
+`poll-interval` is the minimum cached-usage age before another refresh, not a continuous polling timer.
+
 ## Behavior
 
-- Refreshes Anthropic's seven-day usage once per enabled physical Claude OAuth credential on the configured interval; request routing itself reads only the in-memory snapshot.
+- Refreshes enabled physical Claude OAuth credentials when the worker starts; startup reconfiguration retries discovery only while the cache is empty. There is no time-driven polling.
+- When a protected-model request selects an account whose cached usage is at least `poll-interval` old, queues one asynchronous refresh for that account while routing the current request from memory.
+- Coalesces concurrent refreshes, and does not refresh a known blocked account again before its reported reset time.
 - A rejection-only design cannot enforce a pre-exhaustion cutoff: the rejection arrives only after the hard limit is reached.
 - Applies only to exact, case-insensitive `protected-models` matches.
-- Blocks an account at or above `cutoff-percent-used`; unknown or stale quota state fails open.
+- Blocks an account at or above `cutoff-percent-used`; unknown or reset-expired quota state fails open while a refresh is queued.
 - Never changes auth files or CLIProxyAPI's permanent disabled state.
 - Exposes authenticated status at `GET /v0/management/plugins/cliproxyapi-anthropic-router/status`.
 

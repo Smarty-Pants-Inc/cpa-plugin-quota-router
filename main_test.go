@@ -97,6 +97,29 @@ func (f *fakeFetcher) callCount() int {
 	return len(f.calls)
 }
 
+func (f *fakeFetcher) callTokens() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
+type testClock struct {
+	mu    sync.Mutex
+	value time.Time
+}
+
+func (c *testClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.value
+}
+
+func (c *testClock) set(value time.Time) {
+	c.mu.Lock()
+	c.value = value
+	c.mu.Unlock()
+}
+
 func newTestRuntime(host hostClient, fetch usageFetcher, now time.Time) *pluginRuntime {
 	return newPluginRuntime(host, fetch, func() time.Time { return now })
 }
@@ -749,7 +772,7 @@ func TestCancelledPollSkipsHostCallbacks(t *testing.T) {
 	}
 }
 
-func TestReconfigureDoesNotStartDuplicatePollers(t *testing.T) {
+func TestReconfigureDoesNotStartDuplicateRefreshWorkers(t *testing.T) {
 	host := &fakeHost{}
 	fetcher := &fakeFetcher{replies: map[string][]fetchReply{}}
 	runtime := newPluginRuntime(host, fetcher.fetch, time.Now)
@@ -765,12 +788,12 @@ func TestReconfigureDoesNotStartDuplicatePollers(t *testing.T) {
 		runtime.applyConfig(cfg)
 	}
 	if runtime.done != firstDone {
-		t.Fatal("reconfigure replaced the active poller")
+		t.Fatal("reconfigure replaced the active refresh worker")
 	}
 	runtime.shutdown()
 }
 
-func TestShutdownTerminatesPollingLoop(t *testing.T) {
+func TestShutdownTerminatesRefreshWorker(t *testing.T) {
 	host := &fakeHost{}
 	fetcher := &fakeFetcher{replies: map[string][]fetchReply{}}
 	runtime := newPluginRuntime(host, fetcher.fetch, time.Now)
@@ -784,6 +807,106 @@ func TestShutdownTerminatesPollingLoop(t *testing.T) {
 	runtime.shutdown()
 	if runtime.wake != nil || runtime.cancel != nil || runtime.done != nil {
 		t.Fatalf("lifecycle handles not cleared: wake=%v cancel=%v done=%v", runtime.wake != nil, runtime.cancel != nil, runtime.done != nil)
+	}
+}
+
+func TestIdleWorkerDoesNotRefreshOnInterval(t *testing.T) {
+	host := &fakeHost{}
+	runtime := newPluginRuntime(host, (&fakeFetcher{}).fetch, time.Now)
+	cfg := defaultPluginConfig()
+	cfg.PollInterval = 10 * time.Millisecond
+	runtime.applyConfig(cfg)
+	defer runtime.shutdown()
+
+	waitFor(t, func() bool {
+		listCalls, _ := host.counts()
+		return listCalls == 1
+	})
+	time.Sleep(50 * time.Millisecond)
+	listCalls, _ := host.counts()
+	if listCalls != 1 {
+		t.Fatalf("idle refresh calls = %d, want exactly the startup refresh", listCalls)
+	}
+}
+
+func TestStaleRequestRefreshesOnlySelectedAuth(t *testing.T) {
+	startedAt := time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC)
+	clock := &testClock{value: startedAt}
+	host := &fakeHost{
+		entries: []pluginapi.HostAuthFileEntry{
+			physicalEntry("auth-a", "index-a"),
+			physicalEntry("auth-b", "index-b"),
+		},
+		authJSON: map[string]json.RawMessage{
+			"index-a": credentialJSON("token-a"),
+			"index-b": credentialJSON("token-b"),
+		},
+	}
+	fetcher := &fakeFetcher{replies: map[string][]fetchReply{
+		"token-a": {{result: usageResult{WeeklyPercentUsed: 10, ResetAt: startedAt.Add(time.Hour)}}},
+		"token-b": {
+			{result: usageResult{WeeklyPercentUsed: 10, ResetAt: startedAt.Add(time.Hour)}},
+			{result: usageResult{WeeklyPercentUsed: 80, ResetAt: startedAt.Add(time.Hour)}},
+		},
+	}}
+	runtime := newPluginRuntime(host, fetcher.fetch, clock.now)
+	cfg := defaultPluginConfig()
+	cfg.PollInterval = 5 * time.Minute
+	runtime.applyConfig(cfg)
+	defer runtime.shutdown()
+	waitFor(t, func() bool { return fetcher.callCount() == 2 })
+
+	clock.set(startedAt.Add(6 * time.Minute))
+	response, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0), candidate("auth-b", 10)))
+	if decisionError != nil || response.AuthID != "auth-b" {
+		t.Fatalf("response = %#v, error = %#v", response, decisionError)
+	}
+	waitFor(t, func() bool { return fetcher.callCount() == 3 })
+	if calls := fetcher.callTokens(); len(calls) != 3 || calls[0] != "token-a" || calls[1] != "token-b" || calls[2] != "token-b" {
+		t.Fatalf("fetch calls = %#v, want startup auth-a/auth-b then selected auth-b", calls)
+	}
+	if sample := runtime.cache.snapshot("auth-b"); !sample.blocked(clock.now(), cfg.CutoffPercentUsed) {
+		t.Fatalf("selected auth did not refresh to blocked state: %#v", sample)
+	}
+}
+
+func TestBlockedAuthSleepsUntilReset(t *testing.T) {
+	startedAt := time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC)
+	clock := &testClock{value: startedAt}
+	host := &fakeHost{
+		entries:  []pluginapi.HostAuthFileEntry{physicalEntry("auth-a", "index-a")},
+		authJSON: map[string]json.RawMessage{"index-a": credentialJSON("token-a")},
+	}
+	fetcher := &fakeFetcher{replies: map[string][]fetchReply{
+		"token-a": {
+			{result: usageResult{WeeklyPercentUsed: 80, ResetAt: startedAt.Add(time.Hour)}},
+			{result: usageResult{WeeklyPercentUsed: 5, ResetAt: startedAt.Add(8 * 24 * time.Hour)}},
+		},
+	}}
+	runtime := newPluginRuntime(host, fetcher.fetch, clock.now)
+	cfg := defaultPluginConfig()
+	cfg.PollInterval = 5 * time.Minute
+	runtime.applyConfig(cfg)
+	defer runtime.shutdown()
+	waitFor(t, func() bool { return fetcher.callCount() == 1 })
+
+	clock.set(startedAt.Add(6 * time.Minute))
+	if _, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0))); decisionError == nil {
+		t.Fatal("blocked auth should remain unavailable before reset")
+	}
+	time.Sleep(25 * time.Millisecond)
+	if calls := fetcher.callCount(); calls != 1 {
+		t.Fatalf("blocked auth refreshed before reset: %d calls", calls)
+	}
+
+	clock.set(startedAt.Add(time.Hour + time.Minute))
+	response, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0)))
+	if decisionError != nil || response.AuthID != "auth-a" {
+		t.Fatalf("post-reset response = %#v, error = %#v", response, decisionError)
+	}
+	waitFor(t, func() bool { return fetcher.callCount() == 2 })
+	if sample := runtime.cache.snapshot("auth-a"); sample.blocked(clock.now(), cfg.CutoffPercentUsed) {
+		t.Fatalf("post-reset refresh remained blocked: %#v", sample)
 	}
 }
 
