@@ -21,7 +21,7 @@ plugins:
       request-timeout: 10s
 ```
 
-The library basename must be `quota-router` with `.dylib`, `.so`, or `.dll` for the host platform.
+The library basename must be `quota-router` or a semver-suffixed form such as `quota-router-v0.5.0`, with `.dylib`, `.so`, or `.dll` for the host platform.
 
 Published releases include Darwin (`amd64`, `arm64`), Linux (`amd64`, `arm64`), and Windows (`amd64`) builds.
 
