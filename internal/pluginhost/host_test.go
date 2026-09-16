@@ -1728,48 +1728,114 @@ func TestHostCanceledBlockedLoadKeepsOneLoaderAndCleanupPerPlugin(t *testing.T) 
 	}
 }
 
-func TestHostUnloadPluginContextDetachesBlockedCall(t *testing.T) {
-	plugin := validTestPlugin("alpha")
-	client := &blockingHostCallClient{started: make(chan struct{}), release: make(chan struct{}), registration: plugin}
-	loader := &blockingHostCallLoader{client: client}
-	h := NewForTest(loader)
-	cfg := &config.Config{Plugins: config.PluginsConfig{
-		Enabled: true,
-		Dir:     makePluginDir(t, "alpha"),
-		Configs: enabledPluginConfigs("alpha"),
-	}}
-	h.ApplyConfig(context.Background(), cfg)
+func TestHostContextualTeardownRetainsReloadExclusion(t *testing.T) {
+	for _, all := range []bool{false, true} {
+		t.Run(fmt.Sprintf("shutdownAll=%t", all), func(t *testing.T) {
+			plugin := validTestPlugin("alpha")
+			client := &blockingHostCallClient{started: make(chan struct{}), release: make(chan struct{}), registration: plugin,
+				shutdownStarted: make(chan struct{}), shutdownRelease: make(chan struct{})}
+			retiredStarted, retiredRelease := make(chan struct{}), make(chan struct{})
+			retired := &lifecycleTestClient{shutdown: func() { close(retiredStarted); <-retiredRelease }}
+			fresh := &lateLoadClient{registration: plugin}
+			loader := &blockingHostCallLoader{client: client, replacement: fresh}
+			h := NewForTest(loader)
+			var callOnce, shutdownOnce, retiredOnce sync.Once
+			releaseCall := func() { callOnce.Do(func() { close(client.release) }) }
+			releaseShutdown := func() { shutdownOnce.Do(func() { close(client.shutdownRelease) }) }
+			releaseRetired := func() { retiredOnce.Do(func() { close(retiredRelease) }) }
+			defer func() { releaseCall(); releaseShutdown(); releaseRetired(); h.ShutdownAll() }()
+			cfg := &config.Config{Plugins: config.PluginsConfig{Enabled: true, Dir: makePluginDir(t, "alpha"), Configs: enabledPluginConfigs("alpha")}}
+			h.ApplyConfig(context.Background(), cfg)
+			h.mu.Lock()
+			loaded := h.loaded["alpha"]
+			h.retired["alpha"] = []*loadedPlugin{{id: "alpha", client: newGuardedPluginClient(retired)}}
+			h.mu.Unlock()
+			if loaded == nil { t.Fatal("plugin did not load") }
+			go func() { _, _ = loaded.client.Call(context.Background(), pluginabi.MethodUsageHandle, nil) }()
+			waitForHostTestSignal(t, client.started, "blocked plugin call")
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			done := make(chan bool, 1)
+			go func() {
+				if all { h.ShutdownAllContext(ctx); done <- true } else { done <- h.UnloadPluginContext(ctx, "alpha") }
+			}()
+			if !waitForHostTestBool(t, done, "contextual teardown") { t.Fatal("runtime was not detached") }
+			if h.PluginLoaded("alpha") || len(h.activeRecords()) != 0 { t.Fatal("capabilities remained attached") }
+			assertExcluded := func() {
+				t.Helper()
+				for range 3 { h.ApplyConfig(context.Background(), cfg) }
+				if loader.opens.Load() != 1 || !h.PluginBusy("alpha") || h.PluginLoaded("alpha") {
+					t.Fatal("same-ID reapply escaped physical cleanup exclusion")
+				}
+			}
+			assertExcluded()
+			if client.shutdown.Load() != 0 { t.Fatal("shutdown ran before native call completed") }
+			releaseCall()
+			waitForHostTestSignal(t, client.shutdownStarted, "loaded client shutdown")
+			waitForHostTestSignal(t, retiredStarted, "retired client shutdown")
+			assertExcluded()
+			if client.shutdown.Load() != 1 || retired.shutdownCalls.Load() != 1 { t.Fatal("cleanup was not exactly once") }
+			releaseShutdown()
+			deadline := time.Now().Add(time.Second)
+			for {
+				h.mu.Lock()
+				request := h.loading["alpha"]
+				oneRemaining := request != nil && request.unloading == 1
+				h.mu.Unlock()
+				if oneRemaining { break }
+				if time.Now().After(deadline) { t.Fatal("loaded cleanup did not settle with retired exclusion retained") }
+				time.Sleep(time.Millisecond)
+			}
+			// Even after the loaded client settles, the retired client owns
+			// the same ID. Release cannot be tied to just the first target.
+			assertExcluded()
+			releaseRetired()
+			waitForNoPluginLoad(t, h, "alpha")
+			if h.PluginBusy("alpha") { t.Fatal("exclusion survived physical settlement") }
+			h.ApplyConfig(context.Background(), cfg)
+			if loader.opens.Load() != 2 || !h.PluginLoaded("alpha") { t.Fatal("settled ID did not admit fresh instance") }
+			if client.shutdown.Load() != 1 || retired.shutdownCalls.Load() != 1 { t.Fatal("old cleanup repeated on fresh admission") }
+		})
+	}
+}
 
-	h.mu.Lock()
-	loaded := h.loaded["alpha"]
-	h.mu.Unlock()
-	if loaded == nil {
-		t.Fatal("plugin did not load")
-	}
-	go func() { _, _ = loaded.client.Call(context.Background(), pluginabi.MethodUsageHandle, nil) }()
-	waitForHostTestSignal(t, client.started, "blocked plugin call")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	unloadDone := make(chan bool, 1)
-	go func() { unloadDone <- h.UnloadPluginContext(ctx, "alpha") }()
-	if ok := waitForHostTestBool(t, unloadDone, "contextual unload"); !ok {
-		t.Fatal("UnloadPluginContext() = false, want true after detaching runtime")
-	}
-	if h.PluginBusy("alpha") {
-		t.Fatal("PluginBusy(alpha) = true after contextual unload detached runtime")
-	}
-	if got := client.shutdown.Load(); got != 0 {
-		t.Fatalf("shutdown calls before blocked plugin call exits = %d, want 0", got)
-	}
-
-	close(client.release)
-	deadline := time.Now().Add(time.Second)
-	for client.shutdown.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if got := client.shutdown.Load(); got != 1 {
-		t.Fatalf("shutdown calls after blocked plugin call exits = %d, want 1", got)
+func TestHostDetachedCleanupSharesPendingLoadToken(t *testing.T) {
+	for _, loadFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("loadSettlesFirst=%t", loadFirst), func(t *testing.T) {
+			h := NewForTest(&blockingHostCallLoader{})
+			started, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			releaseShutdown := func() { once.Do(func() { close(release) }) }
+			defer releaseShutdown()
+			client := &lifecycleTestClient{shutdown: func() { close(started); <-release }}
+			// Model the existing receipt for a cancelled replacement cleanup.
+			// Its own physical completion calls clearLoadingRequest separately.
+			request := &pluginLoadRequest{cleanupStarted: true}
+			h.loading["alpha"] = request
+			h.loaded["alpha"] = &loadedPlugin{id: "alpha", client: newGuardedPluginClient(client)}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if !h.UnloadPluginContext(ctx, "alpha") { t.Fatal("old instance was not detached") }
+			waitForHostTestSignal(t, started, "detached shutdown")
+			if loadFirst { h.clearLoadingRequest("alpha", request) }
+			if !h.PluginBusy("alpha") { t.Fatal("receipt lost before detached shutdown") }
+			releaseShutdown()
+			if !loadFirst {
+				deadline := time.Now().Add(time.Second)
+				for {
+					h.mu.Lock()
+					remaining := request.unloading
+					h.mu.Unlock()
+					if remaining == 0 { break }
+					if time.Now().After(deadline) { t.Fatal("detached shutdown did not settle") }
+					time.Sleep(time.Millisecond)
+				}
+				if !h.PluginBusy("alpha") { t.Fatal("detached shutdown erased pending load exclusion") }
+				h.clearLoadingRequest("alpha", request)
+			}
+			waitForNoPluginLoad(t, h, "alpha")
+			if client.shutdownCalls.Load() != 1 { t.Fatal("detached cleanup repeated") }
+		})
 	}
 }
 
@@ -2065,18 +2131,25 @@ func (c *lateLoadClient) Shutdown() {
 }
 
 type blockingHostCallLoader struct {
-	client pluginClient
+	client      pluginClient
+	replacement pluginClient
+	opens       atomic.Int32
 }
 
 func (l *blockingHostCallLoader) Open(pluginFile, *Host) (pluginClient, error) {
+	if l.opens.Add(1) > 1 && l.replacement != nil {
+		return l.replacement, nil
+	}
 	return l.client, nil
 }
 
 type blockingHostCallClient struct {
-	started      chan struct{}
-	release      chan struct{}
-	registration pluginapi.Plugin
-	shutdown     atomic.Int32
+	started         chan struct{}
+	release         chan struct{}
+	registration    pluginapi.Plugin
+	shutdown        atomic.Int32
+	shutdownStarted chan struct{}
+	shutdownRelease chan struct{}
 }
 
 func (c *blockingHostCallClient) Call(_ context.Context, method string, _ []byte) ([]byte, error) {
@@ -2098,6 +2171,8 @@ func (c *blockingHostCallClient) Call(_ context.Context, method string, _ []byte
 
 func (c *blockingHostCallClient) Shutdown() {
 	c.shutdown.Add(1)
+	if c.shutdownStarted != nil { close(c.shutdownStarted) }
+	if c.shutdownRelease != nil { <-c.shutdownRelease }
 }
 
 type blockingOpenLoader struct {

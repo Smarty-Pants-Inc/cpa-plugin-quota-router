@@ -101,6 +101,23 @@ func TestSchedulerFilterMixedProvidersAndInvalidResponse(t *testing.T) {
 	}
 }
 
+func TestSchedulerFilterErrorCannotReachSelection(t *testing.T) {
+	selector := &trackingSelector{}
+	m, f := filterManager(t, selector, &Auth{ID: "a", Provider: "claude"}, &Auth{ID: "b", Provider: "codex"})
+	f.filter = func(pluginapi.SchedulerFilterRequest) (pluginapi.SchedulerFilterResponse, error) {
+		return pluginapi.SchedulerFilterResponse{}, errors.New("malformed filter RPC result")
+	}
+	if got, _, err := m.pickNext(context.Background(), "claude", "", cliproxyexecutor.Options{}, nil); err == nil || got != nil {
+		t.Fatalf("single-provider filter error selected: %v %v", got, err)
+	}
+	if got, _, _, err := m.pickNextMixed(context.Background(), []string{"claude", "codex"}, "", cliproxyexecutor.Options{}, nil); err == nil || got != nil {
+		t.Fatalf("mixed-provider filter error selected: %v %v", got, err)
+	}
+	if len(f.requests) != 2 || selector.calls != 0 || len(f.fakePluginScheduler.requests) != 0 {
+		t.Fatal("filter error reached native or legacy selection")
+	}
+}
+
 func TestSchedulerFilterPreservesNativeAffinityAcrossPriorityRecovery(t *testing.T) {
 	affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &RoundRobinSelector{}, TTL: time.Hour})
 	defer affinity.Stop()

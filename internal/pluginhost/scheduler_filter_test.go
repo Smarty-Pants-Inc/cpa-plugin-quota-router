@@ -87,7 +87,12 @@ func TestHostSchedulerFilterAbsentFeatureRefusedBeforeWorkerStart(t *testing.T) 
 }
 
 func TestHostSchedulerFilterRPCMalformedResponseIsNotUnhandled(t *testing.T) {
-	for _, response := range []string{`{"ok":true,"result":{"excluded_ids":[1]}}`, `{"ok":false,"error":{"code":"unknown_method","message":"unsupported"}}`, `not-json`} {
+	for _, response := range []string{
+		`{"ok":true}`, `{"ok":true,"result":null}`, `{"ok":true,"result":{}}`,
+		`{"ok":true,"result":{"other":[]}}`, `{"ok":true,"result":{"excluded_ids":null}}`,
+		`{"ok":true,"result":[]}`, `{"ok":true,"result":{"excluded_ids":[1]}}`,
+		`{"ok":false,"error":{"code":"unknown_method","message":"unsupported"}}`, `not-json`,
+	} {
 		adapter := &rpcPluginAdapter{client: &lifecycleTestClient{call: func(_ context.Context, method string, raw []byte) ([]byte, error) {
 			if method != pluginabi.MethodSchedulerFilter { t.Fatalf("method = %s", method) }
 			var shape map[string]json.RawMessage
@@ -95,6 +100,18 @@ func TestHostSchedulerFilterRPCMalformedResponseIsNotUnhandled(t *testing.T) {
 			if len(shape) != 2 || shape["model"] == nil || shape["candidates"] == nil { t.Fatalf("unsafe request shape: %s", raw) }
 			return []byte(response), nil
 		}}}
-		if _, err := adapter.Filter(context.Background(), pluginapi.SchedulerFilterRequest{Model: "exact(high)"}); err == nil { t.Fatalf("malformed response accepted: %s", response) }
+		h := newHostWithRecords(capabilityRecord{id: "quota", plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{SchedulerFilter: adapter}}})
+		if _, err := h.FilterAuths(context.Background(), pluginapi.SchedulerFilterRequest{Model: "exact(high)", Candidates: []pluginapi.SchedulerFilterCandidate{{ID: "a", Provider: "claude"}}}); err == nil {
+			t.Fatalf("malformed response became permission to route: %s", response)
+		}
 	}
+}
+
+func TestHostSchedulerFilterRPCExplicitEmptyArray(t *testing.T) {
+	adapter := &rpcPluginAdapter{client: &lifecycleTestClient{call: func(context.Context, string, []byte) ([]byte, error) {
+		return []byte(`{"ok":true,"result":{"excluded_ids":[]}}`), nil
+	}}}
+	h := newHostWithRecords(capabilityRecord{id: "quota", plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{SchedulerFilter: adapter}}})
+	response, err := h.FilterAuths(context.Background(), pluginapi.SchedulerFilterRequest{Candidates: []pluginapi.SchedulerFilterCandidate{{ID: "a", Provider: "claude"}}})
+	if err != nil || response.ExcludedIDs == nil || len(response.ExcludedIDs) != 0 { t.Fatalf("explicit empty rejected: %v %v", response, err) }
 }

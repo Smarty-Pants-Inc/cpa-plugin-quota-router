@@ -43,11 +43,14 @@ type pluginUnloadTarget struct {
 	path    string
 	version string
 	client  pluginClient
+	cleanup *pluginLoadRequest
 }
 
 type pluginLoadRequest struct {
 	result         chan pluginLoadResult
 	cleanupStarted bool
+	loadSettled    bool
+	unloading      int
 }
 
 type pluginLoadResult struct {
@@ -544,9 +547,54 @@ func (h *Host) clearLoadingRequest(id string, request *pluginLoadRequest) {
 	}
 	h.mu.Lock()
 	if h.loading[id] == request {
-		delete(h.loading, id)
+		request.loadSettled = true
+		if request.unloading == 0 {
+			delete(h.loading, id)
+		}
 	}
 	h.mu.Unlock()
+}
+
+// retainUnloadTargetsLocked extends the same per-ID exclusion used by pending
+// loads. A cancelled replacement can own a load cleanup AND detached old clients.
+func (h *Host) retainUnloadTargetsLocked(targets []pluginUnloadTarget) {
+	for i := range targets {
+		target := &targets[i]
+		request := h.loading[target.id]
+		if request == nil {
+			request = &pluginLoadRequest{cleanupStarted: true, loadSettled: true}
+			h.loading[target.id] = request
+		}
+		request.unloading++
+		target.cleanup = request
+	}
+}
+
+func (h *Host) shutdownDetachedPlugins(ctx context.Context, targets []pluginUnloadTarget) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan struct{}, len(targets))
+	for _, target := range targets {
+		go func() {
+			shutdownPluginClient(context.Background(), target.client)
+			h.mu.Lock()
+			target.cleanup.unloading--
+			if target.cleanup.loadSettled && target.cleanup.unloading == 0 && h.loading[target.id] == target.cleanup {
+				delete(h.loading, target.id)
+			}
+			h.mu.Unlock()
+			log.WithFields(pluginLogFields(target.id, target.name, target.version, target.path)).Info("pluginhost: plugin unloaded")
+			done <- struct{}{}
+		}()
+	}
+	for range targets {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (h *Host) discardLoadedPlugin(loaded *loadedPlugin) {
@@ -629,6 +677,7 @@ func (h *Host) UnloadPluginContext(ctx context.Context, id string) bool {
 		h.mu.Unlock()
 		return false
 	}
+	h.retainUnloadTargetsLocked(targets)
 	delete(h.loaded, id)
 	delete(h.retired, id)
 	delete(h.fused, id)
@@ -644,12 +693,7 @@ func (h *Host) UnloadPluginContext(ctx context.Context, id string) bool {
 
 	h.refreshThinkingProviders(records)
 	h.RegisterFrontendAuthProviders()
-	for _, target := range targets {
-		if target.client != nil {
-			shutdownPluginClient(ctx, target.client)
-		}
-		log.WithFields(pluginLogFields(target.id, target.name, target.version, target.path)).Info("pluginhost: plugin unloaded")
-	}
+	h.shutdownDetachedPlugins(ctx, targets)
 	return true
 }
 
@@ -699,6 +743,7 @@ func (h *Host) ShutdownAllContext(ctx context.Context) {
 			})
 		}
 	}
+	h.retainUnloadTargetsLocked(targets)
 	h.loaded = make(map[string]*loadedPlugin)
 	h.retired = make(map[string][]*loadedPlugin)
 	h.modelClientIDs = make(map[string]struct{})
@@ -722,10 +767,7 @@ func (h *Host) ShutdownAllContext(ctx context.Context) {
 	for id, request := range loading {
 		h.cleanupCanceledPluginLoad(id, request)
 	}
-	for _, target := range targets {
-		shutdownPluginClient(ctx, target.client)
-		log.WithFields(pluginLogFields(target.id, target.name, target.version, target.path)).Info("pluginhost: plugin unloaded")
-	}
+	h.shutdownDetachedPlugins(ctx, targets)
 }
 
 func (h *Host) lockApply(ctx context.Context) bool {

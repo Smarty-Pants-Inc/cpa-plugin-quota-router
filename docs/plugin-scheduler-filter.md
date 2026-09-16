@@ -41,6 +41,12 @@ It returns the existing OK envelope with:
 {"excluded_ids":["host-auth-id"]}
 ```
 
+At the filter RPC boundary, the OK envelope must contain a non-null result object
+with an explicit `excluded_ids` array. Missing result, null result, missing field
+and a null list are protocol errors. `[]` is the deliberate empty decision. This
+wire requirement does not change nil-slice behavior for in-process typed SDK
+filters or empty results for unrelated legacy RPC methods.
+
 The host checks response count, membership and uniqueness against the original
 offer. Empty, whitespace-modified, duplicate and foreign IDs are errors. The
 plugin cannot add or select an account. No credential path, token, headers,
@@ -83,6 +89,13 @@ Later configuration cannot reconfigure the old instance until the receipt has
 settled successfully. Failure/panic of required quiesce leaves the library
 retained and inactive; final shutdown is still available. There is no timeout
 that frees the callback table while a worker might use it.
+
+Contextual unload and shutdown-all detach capabilities immediately, but retain
+per-ID load/cleanup exclusion until every detached loaded or retired client has
+physically shut down. If a cancelled load/replacement already owns that ID, its
+cleanup and the detached targets share the same exclusion receipt. Cancellation
+or settlement of only one target cannot permit a fresh open/reinit. Repeated
+explicit apply cannot reopen the ID until all owners settle.
 
 The guarded native client serializes register/reconfigure/quiesce until each
 actual native call returns, not until its caller stops waiting. Shutdown retains

@@ -2,6 +2,7 @@ package pluginhost
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -15,7 +16,22 @@ func (h *Host) schedulerFilterSupported() bool {
 }
 
 func (a *rpcPluginAdapter) Filter(ctx context.Context, req pluginapi.SchedulerFilterRequest) (pluginapi.SchedulerFilterResponse, error) {
-	return callPlugin[pluginapi.SchedulerFilterResponse](ctx, a.client, pluginabi.MethodSchedulerFilter, req)
+	raw, err := callPlugin[json.RawMessage](ctx, a.client, pluginabi.MethodSchedulerFilter, req)
+	if err != nil {
+		return pluginapi.SchedulerFilterResponse{}, err
+	}
+	// Wire absence is not a quota decision. Require an explicit array, even
+	// when empty; typed in-process SDK filters may still return a nil slice.
+	var result struct {
+		ExcludedIDs *[]string `json:"excluded_ids"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return pluginapi.SchedulerFilterResponse{}, fmt.Errorf("decode scheduler.filter result: %w", err)
+	}
+	if result.ExcludedIDs == nil {
+		return pluginapi.SchedulerFilterResponse{}, fmt.Errorf("scheduler.filter requires an explicit excluded_ids array")
+	}
+	return pluginapi.SchedulerFilterResponse{ExcludedIDs: *result.ExcludedIDs}, nil
 }
 
 func (h *Host) HasSchedulerFilter() bool {
