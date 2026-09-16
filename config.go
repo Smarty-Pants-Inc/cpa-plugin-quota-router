@@ -168,7 +168,7 @@ func pluginRegistration() registration {
 				{
 					Name:        "poll-interval",
 					Type:        pluginapi.ConfigFieldTypeString,
-					Description: "Minimum cached-usage age before a protected-model request queues another refresh. Default: 5m.",
+					Description: "Minimum interval for request-triggered metadata discovery and selected-account usage refresh. Default: 5m.",
 				},
 				{
 					Name:        "request-timeout",

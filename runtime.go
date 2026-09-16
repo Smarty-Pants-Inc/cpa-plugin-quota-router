@@ -23,20 +23,30 @@ type claudeCredential struct {
 }
 
 type pluginRuntime struct {
-	lifecycleMu sync.Mutex
-	refreshMu   sync.Mutex
-	config      atomic.Pointer[pluginConfig]
-	cache       quotaCache
-	host        hostClient
-	fetch       usageFetcher
-	now         func() time.Time
-	wake        chan struct{}
-	cancel      context.CancelFunc
-	done        chan struct{}
-	pendingAll  bool
-	pendingIDs  map[string]struct{}
-	inFlightAll bool
-	inFlightIDs map[string]struct{}
+	lifecycleMu       sync.Mutex
+	refreshMu         sync.Mutex
+	config            atomic.Pointer[pluginConfig]
+	quiesced          atomic.Bool
+	cache             quotaCache
+	host              hostClient
+	fetch             usageFetcher
+	now               func() time.Time
+	wake              chan struct{}
+	cancel            context.CancelFunc
+	done              chan struct{}
+	pendingDiscovery  bool
+	pendingIDs        map[string]struct{}
+	inFlightDiscovery bool
+	inFlightIDs       map[string]struct{}
+	discovery         discoveryState
+}
+
+// Discovery throttling belongs to the worker, not the prunable account cache.
+// It also bounds retries for unsupported and newly encountered candidate IDs.
+type discoveryState struct {
+	LastAttemptAt     time.Time
+	LastSuccessAt     time.Time
+	LastErrorCategory string
 }
 
 func newPluginRuntime(host hostClient, fetch usageFetcher, now func() time.Time) *pluginRuntime {
@@ -60,6 +70,7 @@ func (r *pluginRuntime) applyConfig(cfg pluginConfig) {
 
 	r.config.Store(&cfg)
 	if !cfg.Enabled {
+		r.quiesced.Store(true)
 		r.stopLocked()
 		r.cache.reconcile(nil)
 		return
@@ -70,7 +81,8 @@ func (r *pluginRuntime) applyConfig(cfg pluginConfig) {
 		done := make(chan struct{})
 		r.wake, r.cancel, r.done = wake, cancel, done
 		go r.refreshLoop(ctx, wake, done)
-		r.queueAllRefreshLocked()
+		r.queueDiscoveryLocked()
+		r.quiesced.Store(false)
 		r.log("info", "quota router refresh worker started", map[string]any{
 			"cutoff_percent_used": cfg.CutoffPercentUsed,
 			"protected_models":    cfg.ProtectedModels,
@@ -78,9 +90,6 @@ func (r *pluginRuntime) applyConfig(cfg pluginConfig) {
 			"request_timeout":     cfg.RequestTimeout.String(),
 		})
 		return
-	}
-	if r.cache.empty() {
-		r.queueAllRefreshLocked()
 	}
 	r.log("info", "quota router configuration reloaded", map[string]any{
 		"cutoff_percent_used": cfg.CutoffPercentUsed,
@@ -96,6 +105,7 @@ func (r *pluginRuntime) shutdown() {
 	}
 	r.lifecycleMu.Lock()
 	defer r.lifecycleMu.Unlock()
+	r.quiesced.Store(true)
 	r.stopLocked()
 }
 
@@ -110,7 +120,7 @@ func (r *pluginRuntime) stopLocked() {
 	}
 	r.wake, r.cancel, r.done = nil, nil, nil
 	r.refreshMu.Lock()
-	r.pendingAll, r.inFlightAll = false, false
+	r.pendingDiscovery, r.inFlightDiscovery = false, false
 	clear(r.pendingIDs)
 	clear(r.inFlightIDs)
 	r.refreshMu.Unlock()
@@ -127,12 +137,12 @@ func (r *pluginRuntime) loadedConfig() pluginConfig {
 	return defaultPluginConfig()
 }
 
-func (r *pluginRuntime) queueAllRefreshLocked() {
+func (r *pluginRuntime) queueDiscoveryLocked() {
 	if r.wake == nil {
 		return
 	}
 	r.refreshMu.Lock()
-	r.pendingAll = true
+	r.pendingDiscovery = true
 	clear(r.pendingIDs)
 	wake := r.wake
 	r.refreshMu.Unlock()
@@ -144,40 +154,36 @@ func (r *pluginRuntime) queueAllRefreshLocked() {
 
 func (r *pluginRuntime) queueCandidateRefresh(authID string, cfg pluginConfig, now time.Time) {
 	authID = strings.TrimSpace(authID)
-	if authID == "" {
+	// ponytail: refresh is best effort. Do not make a request wait behind a
+	// lifecycle join whose host callback has no cancellation contract.
+	if r.quiesced.Load() || !r.lifecycleMu.TryLock() {
 		return
 	}
-	r.lifecycleMu.Lock()
 	defer r.lifecycleMu.Unlock()
-	if r.wake == nil || r.cancel == nil || !r.loadedConfig().Enabled {
+	if r.quiesced.Load() || r.wake == nil || r.cancel == nil || !r.loadedConfig().Enabled {
 		return
 	}
 	r.refreshMu.Lock()
-	if r.pendingAll || r.inFlightAll {
-		r.refreshMu.Unlock()
-		return
+	if !r.pendingDiscovery && !r.inFlightDiscovery &&
+		(r.discovery.LastAttemptAt.IsZero() || !now.Before(r.discovery.LastAttemptAt.Add(cfg.PollInterval))) {
+		r.pendingDiscovery = true
 	}
-	if _, exists := r.pendingIDs[authID]; exists {
-		r.refreshMu.Unlock()
-		return
+	_, pending := r.pendingIDs[authID]
+	_, inFlight := r.inFlightIDs[authID]
+	if !pending && !inFlight && r.cache.refreshDue(authID, now, cfg.CutoffPercentUsed, cfg.PollInterval) {
+		if r.pendingIDs == nil {
+			r.pendingIDs = make(map[string]struct{})
+		}
+		r.pendingIDs[authID] = struct{}{}
 	}
-	if _, exists := r.inFlightIDs[authID]; exists {
-		r.refreshMu.Unlock()
-		return
-	}
-	if !r.cache.claimRefresh(authID, now, cfg.CutoffPercentUsed, cfg.PollInterval) {
-		r.refreshMu.Unlock()
-		return
-	}
-	if r.pendingIDs == nil {
-		r.pendingIDs = make(map[string]struct{})
-	}
-	r.pendingIDs[authID] = struct{}{}
+	queued := r.pendingDiscovery || len(r.pendingIDs) > 0
 	wake := r.wake
 	r.refreshMu.Unlock()
-	select {
-	case wake <- struct{}{}:
-	default:
+	if queued {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -190,15 +196,15 @@ func (r *pluginRuntime) refreshLoop(ctx context.Context, wake <-chan struct{}, d
 		case <-wake:
 		}
 		for {
-			all, authIDs := r.takePendingRefresh()
-			if !all && len(authIDs) == 0 {
+			discover, authIDs := r.takePendingRefresh()
+			if !discover && len(authIDs) == 0 {
 				break
 			}
 			cfg := r.loadedConfig()
 			if cfg.Enabled {
-				r.refreshAuths(ctx, cfg, all, authIDs)
+				r.refreshAuths(ctx, cfg, discover, authIDs)
 			}
-			r.finishRefresh(all, authIDs)
+			r.finishRefresh(discover, authIDs)
 			if ctx.Err() != nil {
 				return
 			}
@@ -209,15 +215,12 @@ func (r *pluginRuntime) refreshLoop(ctx context.Context, wake <-chan struct{}, d
 func (r *pluginRuntime) takePendingRefresh() (bool, map[string]struct{}) {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
-	if r.pendingAll {
-		r.pendingAll = false
-		clear(r.pendingIDs)
-		r.inFlightAll = true
-		return true, nil
-	}
-	if len(r.pendingIDs) == 0 {
+	discover := r.pendingDiscovery
+	if !discover && len(r.pendingIDs) == 0 {
 		return false, nil
 	}
+	r.pendingDiscovery = false
+	r.inFlightDiscovery = discover
 	authIDs := r.pendingIDs
 	r.pendingIDs = make(map[string]struct{})
 	if r.inFlightIDs == nil {
@@ -226,74 +229,107 @@ func (r *pluginRuntime) takePendingRefresh() (bool, map[string]struct{}) {
 	for authID := range authIDs {
 		r.inFlightIDs[authID] = struct{}{}
 	}
-	return false, authIDs
+	return discover, authIDs
 }
 
-func (r *pluginRuntime) finishRefresh(all bool, authIDs map[string]struct{}) {
+func (r *pluginRuntime) finishRefresh(discover bool, authIDs map[string]struct{}) {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
-	if all {
-		r.inFlightAll = false
-		return
+	if discover {
+		r.inFlightDiscovery = false
 	}
 	for authID := range authIDs {
 		delete(r.inFlightIDs, authID)
 	}
 }
 
-func (r *pluginRuntime) pollOnce(ctx context.Context, cfg pluginConfig) {
-	r.refreshAuths(ctx, cfg, true, nil)
-}
-
-func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all bool, authIDs map[string]struct{}) {
-	if r == nil || r.host == nil || r.fetch == nil || ctx.Err() != nil {
-		return
+func (r *pluginRuntime) discoverAuths(ctx context.Context) ([]physicalClaudeAuth, map[string]struct{}, bool) {
+	if r == nil || r.host == nil || ctx.Err() != nil {
+		return nil, nil, false
 	}
+	r.refreshMu.Lock()
+	r.discovery.LastAttemptAt = r.now()
+	r.refreshMu.Unlock()
 	entries, err := r.host.listAuth()
+	if ctx.Err() != nil {
+		return nil, nil, false
+	}
+	r.refreshMu.Lock()
+	if err != nil {
+		r.discovery.LastErrorCategory = "auth_list"
+	} else {
+		r.discovery.LastSuccessAt = r.now()
+		r.discovery.LastErrorCategory = ""
+	}
+	r.refreshMu.Unlock()
 	if err != nil {
 		r.log("warn", "quota router auth discovery failed", map[string]any{"category": "auth_list"})
-		return
+		return nil, nil, false
 	}
 	auths := physicalClaudeAuths(entries)
-	r.cache.reconcile(auths)
+	return auths, r.cache.reconcile(auths), true
+}
+
+func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, discover bool, authIDs map[string]struct{}) {
+	if r.fetch == nil || ctx.Err() != nil {
+		return
+	}
+	var auths []physicalClaudeAuth
+	var changed map[string]struct{}
+	if discover {
+		var ok bool
+		auths, changed, ok = r.discoverAuths(ctx)
+		if !ok {
+			return
+		}
+	} else {
+		auths = r.cache.auths()
+	}
 	for _, auth := range auths {
 		if ctx.Err() != nil {
 			return
 		}
-		if !all {
-			if _, selected := authIDs[auth.ID]; !selected {
-				continue
-			}
+		_, selected := authIDs[auth.ID]
+		_, revised := changed[auth.ID]
+		if (selected || revised) && r.cache.refreshDue(auth.ID, r.now(), cfg.CutoffPercentUsed, cfg.PollInterval) {
+			r.pollAuth(ctx, auth, cfg)
 		}
-		r.pollAuth(ctx, auth, cfg)
 	}
 }
 
 func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig) {
+	if ctx.Err() != nil {
+		return
+	}
 	r.cache.recordAttempt(auth.ID, r.now())
 	rawAuth, err := r.host.getAuth(auth.AuthIndex)
+	if ctx.Err() != nil {
+		return
+	}
 	if err != nil {
-		r.recordPollFailure(auth.ID, pollErrorAuthGet)
+		r.recordPollFailure(auth, pollErrorAuthGet)
 		return
 	}
 	var credential claudeCredential
 	if json.Unmarshal(rawAuth, &credential) != nil {
-		r.recordPollFailure(auth.ID, pollErrorAuthGet)
+		r.recordPollFailure(auth, pollErrorAuthGet)
 		return
 	}
 	token := strings.TrimSpace(credential.AccessToken)
 	if !strings.EqualFold(strings.TrimSpace(credential.Type), "claude") || token == "" {
-		r.recordPollFailure(auth.ID, pollErrorMissingToken)
+		r.recordPollFailure(auth, pollErrorMissingToken)
 		return
 	}
 	result, category := r.fetch(ctx, token, cfg.RequestTimeout)
 	if category != "" {
 		if category != pollErrorCancelled || ctx.Err() == nil {
-			r.recordPollFailure(auth.ID, category)
+			r.recordPollFailure(auth, category)
 		}
 		return
 	}
-	r.cache.recordSuccess(auth.ID, result.WeeklyPercentUsed, result.ResetAt, r.now())
+	if ctx.Err() != nil || !r.cache.recordRevisionSuccess(auth, result, r.now()) {
+		return
+	}
 	r.log("debug", "quota router quota refreshed", map[string]any{
 		"auth_id":             auth.ID,
 		"weekly_percent_used": result.WeeklyPercentUsed,
@@ -301,12 +337,24 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 	})
 }
 
-func (r *pluginRuntime) recordPollFailure(authID, category string) {
-	r.cache.recordFailure(authID, category)
+func (r *pluginRuntime) recordPollFailure(auth physicalClaudeAuth, category string) {
+	if !r.cache.recordRevisionFailure(auth, category) {
+		return
+	}
 	r.log("warn", "quota router quota refresh failed", map[string]any{
-		"auth_id":  authID,
+		"auth_id":  auth.ID,
 		"category": category,
 	})
+}
+
+func (r *pluginRuntime) discoveryStatus() discoveryStatus {
+	r.refreshMu.Lock()
+	defer r.refreshMu.Unlock()
+	return discoveryStatus{
+		LastAttemptAt:     statusTime(r.discovery.LastAttemptAt),
+		LastSuccessAt:     statusTime(r.discovery.LastSuccessAt),
+		LastErrorCategory: r.discovery.LastErrorCategory,
+	}
 }
 
 func (r *pluginRuntime) log(level, message string, fields map[string]any) {

@@ -11,10 +11,10 @@ import (
 )
 
 type physicalClaudeAuth struct {
-	ID        string
-	AuthIndex string
-	Name      string
-	Identity  string
+	ID                 string
+	AuthIndex          string
+	Name               string
+	CredentialRevision string
 }
 
 func physicalClaudeAuths(entries []pluginapi.HostAuthFileEntry) []physicalClaudeAuth {
@@ -32,17 +32,17 @@ func physicalClaudeAuths(entries []pluginapi.HostAuthFileEntry) []physicalClaude
 			continue
 		}
 		auths = append(auths, physicalClaudeAuth{
-			ID:        entry.ID,
-			AuthIndex: entry.AuthIndex,
-			Name:      strings.TrimSpace(entry.Name),
-			Identity:  physicalAuthIdentity(entry),
+			ID:                 entry.ID,
+			AuthIndex:          entry.AuthIndex,
+			Name:               strings.TrimSpace(entry.Name),
+			CredentialRevision: physicalAuthRevision(entry),
 		})
 	}
 	sort.Slice(auths, func(i, j int) bool { return auths[i].ID < auths[j].ID })
 	return auths
 }
 
-func physicalAuthIdentity(entry pluginapi.HostAuthFileEntry) string {
+func physicalAuthRevision(entry pluginapi.HostAuthFileEntry) string {
 	return fmt.Sprintf("index:%q|path:%q|account:%q|email:%q|file:%d:%d",
 		entry.AuthIndex,
 		entry.Path,
@@ -84,6 +84,7 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 		r.queueCandidateRefresh(selected.ID, cfg, now)
 		return pluginapi.SchedulerPickResponse{AuthID: selected.ID, Handled: true}, nil
 	}
+	r.queueCandidateRefresh("", cfg, now)
 	if claudeCandidates > 0 && blockedCandidates == claudeCandidates {
 		return pluginapi.SchedulerPickResponse{}, &envelopeError{Code: exhaustedErrorCode, Message: exhaustedErrorCode}
 	}
@@ -128,6 +129,7 @@ func (r *pluginRuntime) handleManagement(req pluginapi.ManagementRequest) plugin
 		CutoffPercentUsed: cfg.CutoffPercentUsed,
 		ProtectedModels:   cfg.ProtectedModels,
 		Accounts:          r.cache.statuses(r.now(), cfg.CutoffPercentUsed),
+		Discovery:         r.discoveryStatus(),
 	})
 	return pluginapi.ManagementResponse{
 		StatusCode: http.StatusOK,

@@ -121,6 +121,12 @@ int main(int argc, char** argv) {
 	free_plugin_response(&plugin, &response);
 	CHECK(wait_flag(&oversized_freed), 17);
 
+	char quiesce_method[] = "plugin.quiesce";
+	CHECK(plugin.call(quiesce_method, empty_config, 2, &response) == 0, 21);
+	CHECK(response.len == sizeof("{\"ok\":true,\"result\":{}}") - 1 &&
+		memcmp(response.ptr, "{\"ok\":true,\"result\":{}}", response.len) == 0, 22);
+	free_plugin_response(&plugin, &response);
+
 	atomic_store(&response_mode, 2);
 	char reconfigure_method[] = "plugin.reconfigure";
 	CHECK(plugin.call(reconfigure_method, empty_config, 2, &response) == 0, 18);

@@ -140,7 +140,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, fmt.Errorf("decode management request: %w", err)
 		}
 		return okEnvelope(activeRuntime.handleManagement(req))
-	case pluginabi.MethodPluginShutdown:
+	// The pinned SDK predates this optional host method. Quiesce retains
+	// config/cache for explicit reconfigure (including replacement rollback).
+	case "plugin.quiesce", pluginabi.MethodPluginShutdown:
 		activeRuntime.shutdown()
 		return okEnvelope(struct{}{})
 	default:

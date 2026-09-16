@@ -124,6 +124,20 @@ func newTestRuntime(host hostClient, fetch usageFetcher, now time.Time) *pluginR
 	return newPluginRuntime(host, fetch, func() time.Time { return now })
 }
 
+// Direct forced refresh is a test seam, not a production discovery trigger.
+func (r *pluginRuntime) pollOnce(ctx context.Context, cfg pluginConfig) {
+	auths, _, ok := r.discoverAuths(ctx)
+	if !ok {
+		return
+	}
+	for _, auth := range auths {
+		if ctx.Err() != nil {
+			return
+		}
+		r.pollAuth(ctx, auth, cfg)
+	}
+}
+
 func claudeRequest(candidates ...pluginapi.SchedulerAuthCandidate) pluginapi.SchedulerPickRequest {
 	return claudeModelRequest(defaultProtectedModel, candidates...)
 }
@@ -1040,7 +1054,7 @@ func TestManagementStatusRouteExposesOnlySchedulerState(t *testing.T) {
 	}
 	allowedKeys := map[string]bool{
 		"id": true, "auth_index": true, "name": true, "known": true, "blocked": true,
-		"weekly_percent_used": true, "sampled_at": true, "reset_at": true, "last_error_category": true,
+		"weekly_percent_used": true, "sampled_at": true, "last_attempt_at": true, "reset_at": true, "last_error_category": true,
 	}
 	for _, rawAccount := range rawAccounts {
 		account, okAccount := rawAccount.(map[string]any)
