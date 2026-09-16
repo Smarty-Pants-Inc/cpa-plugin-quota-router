@@ -65,9 +65,14 @@ func registerRPCPlugin(ctx context.Context, host *Host, id string, client plugin
 	if client == nil {
 		return pluginapi.Plugin{}, fmt.Errorf("plugin client is nil")
 	}
+	var features []string
+	if host != nil && host.schedulerFilterSupported() {
+		features = []string{pluginapi.SchedulerFilterV1}
+	}
 	resp, errCall := callPlugin[rpcRegistration](ctx, client, method, rpcLifecycleRequest{
 		ConfigYAML:    bytes.Clone(configYAML),
 		SchemaVersion: pluginabi.SchemaVersion,
+		HostFeatures: features,
 	})
 	if errCall != nil {
 		return pluginapi.Plugin{}, errCall
@@ -112,6 +117,12 @@ func registerRPCPlugin(ctx context.Context, host *Host, id string, client plugin
 	}
 	if resp.Capabilities.FrontendAuthProvider {
 		plugin.Capabilities.FrontendAuthProvider = rpcFrontendAuthProvider{rpcPluginAdapter: adapter}
+	}
+	if resp.Capabilities.SchedulerFilterV1 {
+		if len(features) == 0 {
+			return pluginapi.Plugin{}, fmt.Errorf("scheduler_filter_v1 is unsupported in this host mode")
+		}
+		plugin.Capabilities.SchedulerFilter = adapter
 	}
 	if resp.Capabilities.Scheduler {
 		plugin.Capabilities.Scheduler = adapter

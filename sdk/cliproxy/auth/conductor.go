@@ -81,6 +81,13 @@ type pluginSchedulerState interface {
 	HasScheduler() bool
 }
 
+// PluginSchedulerFilter is an optional, separately negotiated restriction.
+// It does not replace the configured native selector.
+type PluginSchedulerFilter interface {
+	HasSchedulerFilter() bool
+	FilterAuths(context.Context, pluginapi.SchedulerFilterRequest) (pluginapi.SchedulerFilterResponse, error)
+}
+
 // StoppableSelector is an optional interface for selectors that hold resources.
 // Selectors that implement this interface will have Stop called during shutdown.
 type StoppableSelector interface {

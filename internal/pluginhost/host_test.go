@@ -975,7 +975,7 @@ func TestHostCallQuiesceClassifiesErrors(t *testing.T) {
 				}
 				return tt.response, tt.errCall
 			}}
-			if h.callQuiesce(context.Background(), &loadedPlugin{id: "alpha", client: client}) {
+			if h.callQuiesce(context.Background(), &loadedPlugin{id: "alpha", client: client, plugin: filterTestPlugin()}) {
 				t.Fatal("callQuiesce() = true, want false")
 			}
 			logs := out.String()
@@ -1084,7 +1084,7 @@ func TestHostApplyConfigSerializesLifecycleDuringQuiesce(t *testing.T) {
 	}
 }
 
-func TestHostApplyConfigRollsBackQuiescedPluginWhenContextCanceled(t *testing.T) {
+func TestHostApplyConfigRequiresExplicitResumeAfterCanceledReplacement(t *testing.T) {
 	events := &lifecycleEventRecorder{}
 	oldClient := &lifecycleTestClient{call: func(_ context.Context, method string, _ []byte) ([]byte, error) {
 		events.add("old." + method)
@@ -1126,6 +1126,11 @@ func TestHostApplyConfigRollsBackQuiescedPluginWhenContextCanceled(t *testing.T)
 	waitForHostTestSignal(t, replacementRegisterStarted, "replacement registration")
 	cancel()
 	waitForHostTestSignal(t, applyDone, "canceled hot reload")
+	waitForNoPluginLoad(t, h, "alpha")
+	if h.PluginRegistered("alpha") {
+		t.Fatal("cancelled replacement silently reactivated the old worker")
+	}
+	h.ApplyConfig(context.Background(), versionedPluginHostConfig(t, pluginsDir, "1.0.0"))
 
 	if got, want := events.snapshot(), []string{
 		"old." + pluginabi.MethodPluginRegister,
@@ -1144,7 +1149,7 @@ func TestHostApplyConfigRollsBackQuiescedPluginWhenContextCanceled(t *testing.T)
 	}
 }
 
-func TestHostApplyConfigShutsDownSuccessfulReplacementBeforeCanceledRollback(t *testing.T) {
+func TestHostApplyConfigShutsDownSuccessfulReplacementBeforeExplicitResume(t *testing.T) {
 	events := &lifecycleEventRecorder{}
 	oldClient := &lifecycleTestClient{call: func(_ context.Context, method string, _ []byte) ([]byte, error) {
 		events.add("old." + method)
@@ -1157,12 +1162,15 @@ func TestHostApplyConfigShutsDownSuccessfulReplacementBeforeCanceledRollback(t *
 			return nil, fmt.Errorf("unexpected old plugin method %s", method)
 		}
 	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	replacementClient := &lifecycleTestClient{
 		call: func(_ context.Context, method string, _ []byte) ([]byte, error) {
 			events.add("replacement." + method)
 			if method != pluginabi.MethodPluginRegister {
 				return nil, fmt.Errorf("unexpected replacement plugin method %s", method)
 			}
+			cancel()
 			return lifecycleRegistrationResult(validTestPlugin("alpha"))
 		},
 		shutdown: func() { events.add("replacement.shutdown") },
@@ -1173,12 +1181,12 @@ func TestHostApplyConfigShutsDownSuccessfulReplacementBeforeCanceledRollback(t *
 	h.ApplyConfig(context.Background(), versionedPluginHostConfig(t, pluginsDir, "1.0.0"))
 	writeVersionedPluginFile(t, pluginsDir, "alpha", "2.0.0")
 
-	ctx := &cancelOnErrContext{
-		Context:  context.Background(),
-		done:     make(chan struct{}),
-		cancelAt: 3,
-	}
 	h.ApplyConfig(ctx, versionedPluginHostConfig(t, pluginsDir, "2.0.0"))
+	waitForNoPluginLoad(t, h, "alpha")
+	if h.PluginRegistered("alpha") {
+		t.Fatal("cancelled successful replacement silently resumed old worker")
+	}
+	h.ApplyConfig(context.Background(), versionedPluginHostConfig(t, pluginsDir, "1.0.0"))
 
 	if got, want := events.snapshot(), []string{
 		"old." + pluginabi.MethodPluginRegister,

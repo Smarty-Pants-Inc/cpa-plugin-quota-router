@@ -948,6 +948,12 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 	if m == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
+	m.mu.RLock()
+	scheduler := m.pluginScheduler
+	m.mu.RUnlock()
+	if activeSchedulerFilter(scheduler) != nil {
+		return nil, &Error{Code: "scheduler_filter_unsupported", Message: "scheduler filters do not support Home routing"}
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}

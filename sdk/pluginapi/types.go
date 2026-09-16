@@ -4,6 +4,7 @@ package pluginapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"time"
@@ -82,6 +83,8 @@ type Capabilities struct {
 	FrontendAuthProviderExclusive bool
 	// Scheduler chooses an auth candidate before the built-in scheduler runs.
 	Scheduler Scheduler
+	// SchedulerFilter excludes admitted candidates before native selection.
+	SchedulerFilter SchedulerFilter
 	// ModelRouter routes matching requests to a plugin executor, the router's own executor,
 	// or a built-in provider before model-to-provider resolution and auth selection.
 	ModelRouter ModelRouter
@@ -470,6 +473,52 @@ const (
 // Scheduler chooses an auth candidate before the built-in scheduler runs.
 type Scheduler interface {
 	Pick(context.Context, SchedulerPickRequest) (SchedulerPickResponse, error)
+}
+
+// SchedulerFilterV1 is the explicitly negotiated eligibility feature. It also
+// requires settled quiesce before disable/replacement and excludes Home mode.
+const SchedulerFilterV1 = "scheduler_filter_v1"
+
+// SchedulerFilter can only exclude candidates admitted by the host.
+type SchedulerFilter interface {
+	Filter(context.Context, SchedulerFilterRequest) (SchedulerFilterResponse, error)
+}
+
+type SchedulerFilterCandidate struct {
+	ID string `json:"id"`
+	Provider string `json:"provider"`
+}
+
+type SchedulerFilterRequest struct {
+	Model string `json:"model"`
+	Candidates []SchedulerFilterCandidate `json:"candidates"`
+}
+
+type SchedulerFilterResponse struct {
+	ExcludedIDs []string `json:"excluded_ids"`
+}
+
+// ValidateSchedulerExclusions rejects malformed responses instead of silently
+// treating a failed filter as permission to route.
+func ValidateSchedulerExclusions(req SchedulerFilterRequest, resp SchedulerFilterResponse) (map[string]struct{}, error) {
+	if len(resp.ExcludedIDs) > len(req.Candidates) {
+		return nil, fmt.Errorf("scheduler filter returned excess exclusions")
+	}
+	offered := make(map[string]struct{}, len(req.Candidates))
+	for _, candidate := range req.Candidates {
+		offered[candidate.ID] = struct{}{}
+	}
+	excluded := make(map[string]struct{}, len(resp.ExcludedIDs))
+	for _, id := range resp.ExcludedIDs {
+		if _, ok := offered[id]; !ok || id == "" {
+			return nil, fmt.Errorf("scheduler filter returned an unknown exclusion")
+		}
+		if _, duplicate := excluded[id]; duplicate {
+			return nil, fmt.Errorf("scheduler filter returned a duplicate exclusion")
+		}
+		excluded[id] = struct{}{}
+	}
+	return excluded, nil
 }
 
 // ModelRouter routes matching requests to a plugin executor, the router's own executor,

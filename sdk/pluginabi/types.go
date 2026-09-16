@@ -53,6 +53,8 @@ const (
 
 	// MethodSchedulerPick asks a scheduler plugin to select an auth candidate.
 	MethodSchedulerPick = "scheduler.pick"
+	// MethodSchedulerFilter is available only with scheduler_filter_v1 negotiation.
+	MethodSchedulerFilter = "scheduler.filter"
 	// MethodModelRoute asks a router plugin to select a plugin executor for a matching request.
 	MethodModelRoute = "model.route"
 

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"sync"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 )
 
 type guardedPluginClient struct {
@@ -13,25 +15,43 @@ type guardedPluginClient struct {
 	calls        int
 	closed       bool
 	shutdownDone chan struct{}
+	lifecycle chan struct{}
 }
 
 func newGuardedPluginClient(inner pluginClient) *guardedPluginClient {
-	client := &guardedPluginClient{inner: inner, shutdownDone: make(chan struct{})}
+	client := &guardedPluginClient{inner: inner, shutdownDone: make(chan struct{}), lifecycle: make(chan struct{}, 1)}
 	client.cond = sync.NewCond(&client.mu)
 	return client
 }
 
 func (c *guardedPluginClient) Call(ctx context.Context, method string, request []byte) ([]byte, error) {
-	inner, errAcquire := c.acquire()
-	if errAcquire != nil {
-		return nil, errAcquire
-	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if c == nil {
+		return nil, fmt.Errorf("plugin client is closed")
+	}
+	lifecycle := method == pluginabi.MethodPluginRegister || method == pluginabi.MethodPluginReconfigure || method == pluginabi.MethodPluginQuiesce
+	if lifecycle {
+		select {
+		case c.lifecycle <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		if lifecycle { <-c.lifecycle }
+		return nil, err
+	}
+	inner, errAcquire := c.acquire()
+	if errAcquire != nil {
+		if lifecycle { <-c.lifecycle }
+		return nil, errAcquire
 	}
 	result := make(chan guardedPluginCallResult, 1)
 	go func() {
 		defer c.release()
+		if lifecycle { defer func() { <-c.lifecycle }() }
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				result <- guardedPluginCallResult{recovered: recovered}

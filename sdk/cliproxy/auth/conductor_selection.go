@@ -36,6 +36,9 @@ func (m *Manager) hasPluginScheduler() bool {
 	if scheduler == nil {
 		return false
 	}
+	if filter, ok := scheduler.(PluginSchedulerFilter); ok && filter.HasSchedulerFilter() {
+		return true
+	}
 	if state, ok := scheduler.(pluginSchedulerState); ok {
 		return state.HasScheduler()
 	}
@@ -53,11 +56,13 @@ func isBuiltInSelector(selector Selector) bool {
 
 type requiredAuthKindContextKey struct{}
 type credentialPolicyContextKey struct{}
+type filteredAuthIDsContextKey struct{}
 
 type authSelectionEligibility struct {
 	requiredKind     string
 	credentialPolicy string
 	disallowFreeAuth bool
+	filteredAuthIDs map[string]struct{}
 }
 
 func withRequiredAuthKind(ctx context.Context, requiredKind string) context.Context {
@@ -81,6 +86,7 @@ func authSelectionEligibilityForRequest(ctx context.Context, opts cliproxyexecut
 	if ctx != nil {
 		eligibility.requiredKind, _ = ctx.Value(requiredAuthKindContextKey{}).(string)
 		eligibility.credentialPolicy, _ = ctx.Value(credentialPolicyContextKey{}).(string)
+		eligibility.filteredAuthIDs, _ = ctx.Value(filteredAuthIDsContextKey{}).(map[string]struct{})
 	}
 	return eligibility
 }
@@ -88,6 +94,11 @@ func authSelectionEligibilityForRequest(ctx context.Context, opts cliproxyexecut
 func (e authSelectionEligibility) allows(auth *Auth) bool {
 	if auth == nil {
 		return false
+	}
+	if e.filteredAuthIDs != nil {
+		if _, admitted := e.filteredAuthIDs[auth.ID]; !admitted {
+			return false
+		}
 	}
 	if e.requiredKind != "" && auth.AuthKind() != e.requiredKind {
 		return false
@@ -1603,6 +1614,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	selector := m.selector
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = selectionArgForSelector(selector, model)
 	pluginScheduler := m.pluginScheduler
+	m.mu.RUnlock()
+	filter := activeSchedulerFilter(pluginScheduler)
+	m.mu.RLock()
 	executor, okExecutor := m.executors[provider]
 	if !okExecutor {
 		m.mu.RUnlock()
@@ -1640,7 +1654,14 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, provider, model, time.Now())
+	var available, selectorAuths []*Auth
+	var errAvailable error
+	if filter != nil {
+		available, errAvailable = m.availableAuthsForRouteModelAcrossPriorities(candidates, provider, model, time.Now())
+		available = cloneAuthSlice(available)
+	} else {
+		available, selectorAuths, errAvailable = m.availableAuthsForSelector(selector, candidates, provider, model, time.Now())
+	}
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errAvailable)
@@ -1648,6 +1669,12 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	m.mu.RUnlock()
 
+	if filter != nil {
+		ctx, available, selectorAuths, errAvailable = filterAvailableAuths(ctx, filter, selector, model, available)
+		if errAvailable != nil {
+			return nil, nil, errAvailable
+		}
+	}
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
 	if errPick != nil {
 		m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errPick)
@@ -1931,6 +1958,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	selector := m.selector
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = selectionArgForSelector(selector, model)
 	pluginScheduler := m.pluginScheduler
+	m.mu.RUnlock()
+	filter := activeSchedulerFilter(pluginScheduler)
+	m.mu.RLock()
 	candidates := make([]*Auth, 0, len(m.auths))
 	modelKey := strings.TrimSpace(model)
 	// Always use base model name (without thinking suffix) for auth matching.
@@ -1973,7 +2003,14 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, "mixed", model, time.Now())
+	var available, selectorAuths []*Auth
+	var errAvailable error
+	if filter != nil {
+		available, errAvailable = m.availableAuthsForRouteModelAcrossPriorities(candidates, "mixed", model, time.Now())
+		available = cloneAuthSlice(available)
+	} else {
+		available, selectorAuths, errAvailable = m.availableAuthsForSelector(selector, candidates, "mixed", model, time.Now())
+	}
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errAvailable)
@@ -1981,6 +2018,12 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	m.mu.RUnlock()
 
+	if filter != nil {
+		ctx, available, selectorAuths, errAvailable = filterAvailableAuths(ctx, filter, selector, model, available)
+		if errAvailable != nil {
+			return nil, nil, "", errAvailable
+		}
+	}
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
 	if errPick != nil {
 		m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errPick)

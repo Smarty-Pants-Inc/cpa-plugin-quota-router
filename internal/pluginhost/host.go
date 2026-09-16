@@ -29,6 +29,7 @@ type loadedPlugin struct {
 	plugin     pluginapi.Plugin
 	registered bool
 	client     pluginClient
+	quiesce    *pluginQuiesce
 }
 
 type modelExecutor interface {
@@ -225,6 +226,7 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg *config.Config) {
 		h.snapshot.Store(emptySnapshot())
 		h.mu.Unlock()
 		h.refreshThinkingProviders(nil)
+		h.quiesceInactivePlugins(ctx, nil)
 		return
 	}
 
@@ -239,9 +241,17 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg *config.Config) {
 		h.snapshot.Store(emptySnapshot())
 		h.mu.Unlock()
 		h.refreshThinkingProviders(nil)
+		h.quiesceInactivePlugins(ctx, nil)
 		return
 	}
 	files = h.withLoadedPluginFallbacks(files, rc.Items, desiredVersions)
+	active := make(map[string]bool, len(files))
+	for _, file := range files {
+		active[file.ID] = rc.Items[file.ID].Enabled
+	}
+	if !h.quiesceInactivePlugins(ctx, active) {
+		return
+	}
 
 	records := make([]capabilityRecord, 0, len(files))
 	loadedFiles := make([]pluginFile, 0, len(files))
@@ -282,10 +292,11 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg *config.Config) {
 			h.mu.Unlock()
 
 			if replaced != nil {
-				h.callQuiesce(ctx, replaced)
-				if errContext := ctx.Err(); errContext != nil {
+				h.deactivatePlugin(replaced.id)
+				if !h.callQuiesce(ctx, replaced) {
 					h.clearLoadingRequest(file.ID, request)
-					_, _, _ = h.rollbackReplacement(replaced, item)
+					// Retain the old library and unsettled operation. Do not
+					// register either version while quiesce ownership is unknown.
 					return
 				}
 			}
@@ -296,17 +307,25 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg *config.Config) {
 				if replaced == nil {
 					h.cleanupCanceledPluginLoad(file.ID, request)
 				} else {
-					h.cleanupCanceledPluginLoadAndWait(file.ID, request)
-					_, _, _ = h.rollbackReplacement(replaced, item)
+					// Cleanup keeps the load token until actual shutdown. A
+					// later explicit ApplyConfig may resume the retained old
+					// library; cancellation is not permission to overlap workers.
+					h.cleanupCanceledPluginLoad(file.ID, request)
 				}
+				return
+			}
+			if ctx.Err() != nil {
+				h.cleanupPluginLoad(file.ID, request, loadResult.loaded)
 				return
 			}
 			if loadResult.err != nil || (replaced != nil && !loadResult.initialized) {
 				if replaced == nil {
 					h.cleanupPluginLoad(file.ID, request, loadResult.loaded)
 				} else {
-					h.cleanupPluginLoadAndWait(file.ID, request, loadResult.loaded)
-					if rollbackRecord, rollbackFile, okRollback := h.rollbackReplacement(replaced, item); okRollback {
+					if !h.cleanupPluginLoadAndWait(ctx, file.ID, request, loadResult.loaded) {
+						return
+					}
+					if rollbackRecord, rollbackFile, okRollback := h.rollbackReplacement(ctx, replaced, item); okRollback {
 						records = append(records, rollbackRecord)
 						loadedFiles = append(loadedFiles, rollbackFile)
 					}
@@ -322,7 +341,7 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg *config.Config) {
 				h.mu.Unlock()
 				h.discardLoadedPlugin(loadResult.loaded)
 				if replaced != nil {
-					_, _, _ = h.rollbackReplacement(replaced, item)
+					_, _, _ = h.rollbackReplacement(ctx, replaced, item)
 				}
 				return
 			}
@@ -331,8 +350,7 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg *config.Config) {
 				if replaced == nil {
 					h.cleanupPluginLoad(file.ID, request, loadResult.loaded)
 				} else {
-					h.cleanupPluginLoadAndWait(file.ID, request, loadResult.loaded)
-					_, _, _ = h.rollbackReplacement(replaced, item)
+					h.cleanupPluginLoad(file.ID, request, loadResult.loaded)
 				}
 				return
 			}
@@ -469,23 +487,6 @@ func (h *Host) cleanupCanceledPluginLoad(id string, request *pluginLoadRequest) 
 	}()
 }
 
-func (h *Host) cleanupCanceledPluginLoadAndWait(id string, request *pluginLoadRequest) {
-	if h == nil || request == nil || request.result == nil {
-		return
-	}
-	h.mu.Lock()
-	if h.loading[id] != request || request.cleanupStarted {
-		h.mu.Unlock()
-		return
-	}
-	request.cleanupStarted = true
-	h.mu.Unlock()
-
-	result := <-request.result
-	h.discardLoadedPlugin(result.loaded)
-	h.clearLoadingRequest(id, request)
-}
-
 // cleanupPluginLoad retains the matching load token until the client has physically
 // shut down, preventing a replacement ApplyConfig from opening a second client.
 func (h *Host) cleanupPluginLoad(id string, request *pluginLoadRequest, loaded *loadedPlugin) {
@@ -503,20 +504,31 @@ func (h *Host) cleanupPluginLoad(id string, request *pluginLoadRequest, loaded *
 	h.finishPluginLoadCleanup(id, request, loaded)
 }
 
-func (h *Host) cleanupPluginLoadAndWait(id string, request *pluginLoadRequest, loaded *loadedPlugin) {
+func (h *Host) cleanupPluginLoadAndWait(ctx context.Context, id string, request *pluginLoadRequest, loaded *loadedPlugin) bool {
 	if h == nil || request == nil {
-		return
+		return false
 	}
 	h.mu.Lock()
 	if h.loading[id] != request || request.cleanupStarted {
 		h.mu.Unlock()
-		return
+		return false
 	}
 	request.cleanupStarted = true
 	h.mu.Unlock()
 
-	h.discardLoadedPlugin(loaded)
-	h.clearLoadingRequest(id, request)
+	done := make(chan struct{})
+	go func() {
+		h.discardLoadedPlugin(loaded)
+		h.clearLoadingRequest(id, request)
+		close(done)
+	}()
+	select {
+	case <-done:
+		return ctx.Err() == nil
+	case <-ctx.Done():
+		// The load token retains exclusion until real shutdown returns.
+		return false
+	}
 }
 
 func (h *Host) finishPluginLoadCleanup(id string, request *pluginLoadRequest, loaded *loadedPlugin) {
@@ -849,17 +861,7 @@ func (h *Host) rebuildActivePluginMapsLocked(records []capabilityRecord) {
 }
 
 func (h *Host) callQuiesce(ctx context.Context, lp *loadedPlugin) bool {
-	if h == nil || lp == nil || lp.client == nil {
-		return false
-	}
-	errQuiesce, okCall := h.safePluginAction(ctx, lp.id, pluginabi.MethodPluginQuiesce, func() error {
-		_, errCall := callPlugin[rpcEmptyResponse](ctx, lp.client, pluginabi.MethodPluginQuiesce, rpcEmptyResponse{})
-		return errCall
-	})
-	if errQuiesce != nil {
-		logQuiesceError(lp.id, errQuiesce)
-	}
-	return okCall && errQuiesce == nil
+	return h.awaitQuiesce(ctx, lp)
 }
 
 func logQuiesceError(id string, errQuiesce error) {
@@ -904,26 +906,24 @@ func quiesceUnsupported(errQuiesce error) bool {
 	return false
 }
 
-func (h *Host) rollbackReplacement(lp *loadedPlugin, item runtimeItemConfig) (capabilityRecord, pluginFile, bool) {
+func (h *Host) rollbackReplacement(ctx context.Context, lp *loadedPlugin, item runtimeItemConfig) (capabilityRecord, pluginFile, bool) {
 	if h == nil || lp == nil {
 		return capabilityRecord{}, pluginFile{}, false
 	}
 	h.mu.Lock()
 	configYAML := bytes.Clone(lp.configYAML)
-	previousPlugin := lp.plugin
 	h.mu.Unlock()
 	if len(configYAML) > 0 {
 		item.ConfigYAML = configYAML
 	}
 
-	plugin, okCall := h.callRegister(context.Background(), lp, item)
-	if okCall {
-		h.mu.Lock()
-		delete(h.fused, lp.id)
-		h.mu.Unlock()
-	} else {
-		plugin = previousPlugin
+	plugin, okCall := h.callRegister(ctx, lp, item)
+	if !okCall {
+		return capabilityRecord{}, pluginFile{}, false
 	}
+	h.mu.Lock()
+	delete(h.fused, lp.id)
+	h.mu.Unlock()
 	if !validPlugin(plugin) {
 		return capabilityRecord{}, pluginFile{}, false
 	}
@@ -942,7 +942,7 @@ func (h *Host) rollbackReplacement(lp *loadedPlugin, item runtimeItemConfig) (ca
 }
 
 func (h *Host) callRegister(ctx context.Context, lp *loadedPlugin, item runtimeItemConfig) (pluginapi.Plugin, bool) {
-	if lp == nil {
+	if lp == nil || !h.canResumePlugin(lp) {
 		return pluginapi.Plugin{}, false
 	}
 
@@ -980,6 +980,7 @@ func (h *Host) callRegister(ctx context.Context, lp *loadedPlugin, item runtimeI
 	}
 	lp.configYAML = bytes.Clone(item.ConfigYAML)
 	lp.plugin = plugin
+	lp.quiesce = nil
 	h.mu.Unlock()
 	return plugin, true
 }
@@ -1041,6 +1042,7 @@ func validPlugin(plugin pluginapi.Plugin) bool {
 		caps.AuthProvider != nil ||
 		caps.FrontendAuthProvider != nil ||
 		caps.Scheduler != nil ||
+		caps.SchedulerFilter != nil ||
 		caps.ModelRouter != nil ||
 		caps.Executor != nil ||
 		caps.RequestTranslator != nil ||
