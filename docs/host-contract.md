@@ -1,144 +1,97 @@
-# Host eligibility and lifecycle contract proposal
+# Negotiated filter consumer contract
 
-Status: **integration-owner-accepted direction, not an implemented eligibility
-API**. On 2026-09-16 dev-lead accepted the exact maintained source destination and
-minimal explicitly negotiated filter direction below. No host source writer is
-assigned. The current plugin still registers `scheduler.pick`. Discovery and
-optional quiesce support can be reviewed independently. Do not ship a filter-only
-plugin against an unsupported host or treat this document as activation authority.
+This consumer is based on frozen legacy plugin
+`8c6efa015ecd75e9225cc99c7ff82626a2905b4d`, tree
+`9e97c097bb2c62e529a8410b224d267928450742`. The legacy candidate and test-only
+`8e531375c8efe54fb4de1ddf507c79a753a45c23` remain separate evidence.
 
-## Maintained integration destination
+Its required host source is frozen private candidate
+`a2020b618173204312d11610000e76b2444260d9`, tree
+`a2422722564bfa47f0c917747df382dbde25107a`, based on maintained upstream
+`router-for-me/CLIProxyAPI` `8335eac731946bd4eff18f500653f93736df53d6`, tree
+`13942c68d7859e102308cf683e9aa820b7c39018`. This does not modify or qualify an
+installed gateway. The historical 4b5/1e1e diagnostic and April fork remain distinct.
 
-Read-only upstream inspection on 2026-09-16 selected:
+## Wire contract
 
-- Repository: `https://github.com/router-for-me/CLIProxyAPI`, maintained `main`.
-- Commit: `8335eac731946bd4eff18f500653f93736df53d6`.
-- Tree: `13942c68d7859e102308cf683e9aa820b7c39018`.
-- Commit date: 2026-09-15T12:08:12Z. Repository metadata was not archived or disabled.
-- Native ABI 1; JSON schema 6. The plugin's SDK pin remains v7.2.100.
+C ABI 1 and JSON schema 6 are unchanged. In `plugin.register` and
+`plugin.reconfigure`, the host sends `host_features:["scheduler_filter_v1"]`
+with the existing base64 `config_yaml`. Absent or unknown features yield an
+`unsupported_host` envelope before config application or worker startup. If an
+existing instance loses the feature, it first stops admission and joins its worker,
+then reports refusal. It never starts a legacy picker as fallback.
 
-Proposed host destination: an upstream-targeted change based on that exact main
-commit, reconciled by the gateway integration owner before implementation. It is
-not the historical April Smarty fork and not the frozen `4b5f1eab` tool-prefix
-regression archive. A new head must be re-inspected before rebasing the proposal.
-No host source has been changed by this plugin task.
+Registration advertises `scheduler_filter_v1:true` and `management_api:true`,
+not `scheduler:true`. `scheduler.pick` is no longer implemented. `scheduler.filter`
+is refused until successful explicit negotiation. It receives:
 
-## Existing seams and remaining gap
+```json
+{"model":"configured-model","candidates":[{"id":"auth-id","provider":"claude"}]}
+```
 
-At the selected host:
+It returns the existing OK envelope containing exactly:
 
-- `sdk/cliproxy/auth/conductor_selection.go` already separates
-  `availableAuthsForRouteModelAcrossPriorities` from `highestPriorityAuths` and
-  `availableAuthsForSelector`. Reuse that availability pass.
-- `pickNextLegacy` and `pickNextMixedLegacy` enforce request eligibility,
-  pinning, tried IDs, executor/model support and disabled state, then compute
-  availability. They call the scheduler with only the top priority tier.
-- The native affinity selector receives lower tiers where needed, while the
-  plugin scheduler does not. Preserve this distinction after exclusions.
-- `sdk/pluginapi/types.go` and `sdk/pluginabi/types.go` expose only an auth-ID
-  selection or named builtin delegation, not candidate exclusions.
-- `internal/pluginhost/scheduler.go` uses only the highest-priority scheduler
-  plugin. An unhandled return does not chain scheduler plugins.
-- A named builtin delegate reselects from host state. It cannot enforce an
-  exclusion set unless that set remains attached to that same selection attempt.
-- Home routing bypasses local selection. It is not quota-qualified by this seam.
+```json
+{"excluded_ids":["auth-id"]}
+```
 
-## Minimum optional operation to agree before host source edits
+IDs must be nonempty, whitespace-exact and unique, with a nonempty provider.
+Invalid offers return `invalid_candidates` without queuing work. Responses are
+bounded by the offered count, duplicate-free, and cannot contain an unoffered ID.
+Only offered Claude candidates for exact configured models can be excluded.
+Case-insensitive model matching and outer whitespace handling are unchanged;
+suffixes/aliases are not canonicalized. Empty exclusions mean no known quota block,
+not permission to add candidates. All-blocked returns all exclusions; only the host
+turns exhaustion into its routing error. No priority, account selection, body,
+headers, tokens, paths or arbitrary auth metadata enters this wire request.
 
-Proposed operation: `scheduler.filter`, negotiated by an explicit versioned host
-feature `scheduler_filter_v1` in register/reconfigure requests. The registration
-response advertises the matching filter capability separately from `scheduler`.
-Names and schema allocation require gateway-owner agreement; they are not current
-upstream fields. Keep native ABI 1 if its layout need not change.
+## Native ownership and worker reuse
 
-Request fields: the route's exact requested model and admitted candidate pairs
-`{id, provider}`. Do not send token material, credential paths, request bodies,
-headers, arbitrary auth metadata or a guessed provider quota identity. Each
-candidate has already passed host request/security/pinning/tried/model/cooldown
-checks **across priority tiers**. The plugin returns only `excluded_ids`.
+The paired host offers all priority tiers after native admission rules and applies
+exclusions before native selection. Its existing scheduler owns highest-tier
+choice, weights, round-robin, fill-first and affinity. Its attempt-local allowed-ID
+scope prevents builtin delegation/resync/retry from resurrecting excluded or
+unoffered candidates. Filter precedence is separate from legacy scheduler priority.
+Home does not advertise support and refuses active filter enforcement.
 
-Host rules:
+This consumer makes only memory decisions in the callback. Due discovery and
+usage refresh reuse the existing single worker, queue coalescing, independent
+metadata throttle, credential revision guards, fail-open quota policy and reset
+handling. Since selection now follows filtering, due usage refresh covers offered
+eligible credentials rather than a plugin-selected credential. That is the only
+necessary admission change; there is still no idle timer or provider sweep of
+unchanged unoffered accounts. All-blocked requests still trigger bounded metadata
+discovery. Unsupported IDs cannot erase the discovery throttle.
 
-1. Call the filter outside the manager lock. Validate every excluded ID as a
-   unique member of the offered set; bound the response by that set's size.
-2. Subtract exclusions, then use the existing priority/distribution/affinity
-   logic. The plugin cannot select or add an account. Do not implement a second
-   selector in the plugin.
-3. Reapply the filter on each real selection/retry path. Legacy scheduler plugins
-   receive only the remaining eligible candidates. Their builtin-delegate path
-   must retain the same exclusions; it must not reintroduce excluded IDs.
-4. A pinned excluded account does not authorize another account. Empty remaining
-   candidates produce explicit quota exhaustion, not an unhandled fallback.
-5. Separate mandatory filter invocation from legacy scheduler precedence. A
-   higher-priority scheduler must not silently shadow quota filtering. Multiple
-   filter composition is not needed for this first pair; refuse unsupported
-   combinations rather than inventing a plugin pipeline.
-6. Preserve configured selector behavior, including its existing affinity rule
-   for a valid lower-priority binding. Revalidate native eligibility as required
-   by the manager's concurrency contract. Never mutate auth disabled/cooldown
-   state as a substitute for exclusions.
-7. Unsupported active Home mode must be explicit at registration/configuration;
-   do not advertise filter enforcement for bypass paths.
+`plugin.quiesce` cancels and physically joins the worker, retains cache/configuration,
+and permits cached filtering while the host withdraws the old record. It never
+resumes automatically. A later supported reconfigure resumes through the existing
+worker lifecycle. Direct disabled plugin configuration joins and clears cache.
+Host-level disable instead withdraws records and quiesces the retained instance.
+The host owns cancellation receipts, lifecycle-call serialization, replacement
+admission and callback-table/library custody. A C callback has no cancellation
+context: a stuck callback keeps physical settlement pending. No timeout or detached
+worker is treated as joined, and unsupported-feature refusal during such a join
+can remain pending too.
 
-Plugin rules: exact case-insensitive configured-model matching; exclude only
-known-blocked physical Claude credentials within the offered set. Unknown and
-reset-expired samples fail open. Other provider candidates remain untouched.
-Do not infer protection for an unconfigured alias or suffix. Mixed routes can
-filter their Claude subset only after that exact behavior is covered by pair
-acceptance. The current legacy plugin still leaves multi-provider routes alone.
+## Evidence boundaries
 
-Negotiation is required **before starting the worker or registering capabilities**.
-A future filter-only plugin must return `unsupported_host` when the host feature
-is missing or too old, including a missing/zero legacy request. An unknown JSON
-field or a host ignoring a response capability is not negotiation. Keep old host /
-old plugin and new host / old plugin paths unchanged. Do not silently fall back
-from the new filter plugin to lexical selection.
+Real consumer RPC-to-worker tests cover negotiation before startup, offered-only
+exclusions, exact models, mixed providers, replacement discovery, and retained
+lifecycle ownership through quiesce/disable/feature loss. The C-shared harness adds
+native absent-feature refusal with zero host callbacks, supported reconfiguration
+and filter-wire checks. These tests are source inputs until actually executed.
 
-A trustworthy opaque credential revision would improve list/get/sample consistency,
-but none was found in this host contract. This proposal does not invent one. The
-plugin's conservative, eventually discovered file revision remains a documented
-limit until an actual host/adapter revision contract is accepted.
+The isolated process harness accepts all four explicit source combinations. New/new
+also gives the more-used blocked account higher native priority and a distinct
+loopback proxy, to detect selection before exclusions or retry resurrection. It
+checks disable and explicit re-enable. Rejected old-host/new-consumer checks actual
+host refusal, no plugin status route and no provider usage. The host packet's
+manager/lifecycle tests remain required for the broader affinity, pinning,
+replacement failure and cancelled callback cases.
 
-## Lifecycle correspondence
-
-The selected host already calls `plugin.quiesce` with `{}` before replacement,
-and `plugin.reconfigure` on the previous library during replacement rollback.
-This plugin implements that existing optional method without changing its SDK pin:
-stop new refresh admission, cancel and **join** the one worker, retain config and
-cache, then resume with fresh metadata discovery only on explicit enabled
-register/reconfigure. Repeated quiesce/shutdown is safe. Cached quota decisions
-remain available because the old host record can still be used during replacement.
-Request-triggered refresh does not wait behind a lifecycle join.
-
-A host auth/log callback has no cancellation context in the current C ABI. Quiesce
-can therefore wait for that callback. It must not time out, detach the worker and
-return success. `dynamicLibraryClient.Shutdown` calls plugin shutdown before freeing
-its callback context/table and closing the library. Preserve that order.
-
-The host's `guardedPluginClient` can return to its caller after context cancellation
-while it retains cleanup ownership. That is not proof of a completed join. In
-`Host.ApplyConfig`, failed/cancelled quiesce can still be followed by replacement;
-global and instance disable remove active records without calling quiesce. Thus
-plugin support alone does **not** qualify host disable or guarantee one worker
-across replacement. The host owner must gate replacement on settled quiesce and
-quiesce disabled/removed instances before retaining them. On uncertainty, retain
-library/callback custody; do not free it or claim settled cleanup.
-
-## Required paired checks
-
-Use the real selected manager and native host/library harness, with synthetic
-credentials/provider endpoints only:
-
-- High-priority blocked A / low-priority eligible B; equal-tier native
-  distribution; affinity; pinned blocked account; all excluded.
-- Disabled/cooling/tried/model-ineligible accounts; mixed providers; exact
-  model/alias/suffix handling; retries; scheduler coexistence; Home refusal.
-- Duplicate/foreign excluded IDs; malformed/error filter responses; unsupported
-  host negotiation before any plugin worker starts.
-- Old/old, new-host/old-plugin, new/new, and refused new-plugin/old-host pairs.
-- Disable/re-enable, config reload, blocked host callback, provider cancellation,
-  quiesce, successful replacement, failed replacement rollback, final shutdown,
-  and callback-table lifetime.
-
-Current fake-host/RPC and Unix ABI tests are inputs to that qualification. They
-are not a substitute for it, and no execution result is asserted in this document.
+Those fixtures are not complete packaged-release qualification. In particular,
+process tests override the usage endpoint for loopback fixtures and do not test
+signed/distributed release bytes. Exact packaged-library receiving, real native
+replacement/shutdown/callback-custody coverage, independent review and explicit
+activation remain gates. See [release qualification](release-qualification.md).

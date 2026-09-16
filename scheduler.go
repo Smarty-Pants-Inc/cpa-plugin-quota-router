@@ -53,52 +53,57 @@ func physicalAuthRevision(entry pluginapi.HostAuthFileEntry) string {
 	)
 }
 
-func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, *envelopeError) {
-	cfg := r.loadedConfig()
-	if !cfg.Enabled || !isClaudeRequest(req) || !isProtectedModel(req.Model, cfg.ProtectedModels) {
-		return pluginapi.SchedulerPickResponse{Handled: false}, nil
-	}
-	now := r.now()
-	var selected *pluginapi.SchedulerAuthCandidate
-	claudeCandidates, blockedCandidates := 0, 0
-	for i := range req.Candidates {
-		candidate := &req.Candidates[i]
-		provider := strings.ToLower(strings.TrimSpace(candidate.Provider))
-		if provider != "" && provider != "claude" {
-			continue
-		}
-		if candidate.ID == "" || strings.TrimSpace(candidate.ID) != candidate.ID {
-			continue
-		}
-		claudeCandidates++
-		if r.cache.isBlocked(candidate.ID, now, cfg.CutoffPercentUsed) {
-			blockedCandidates++
-			continue
-		}
-		if selected == nil || candidate.Priority > selected.Priority ||
-			(candidate.Priority == selected.Priority && candidate.ID < selected.ID) {
-			selected = candidate
-		}
-	}
-	if selected != nil {
-		r.queueCandidateRefresh(selected.ID, cfg, now)
-		return pluginapi.SchedulerPickResponse{AuthID: selected.ID, Handled: true}, nil
-	}
-	r.queueCandidateRefresh("", cfg, now)
-	if claudeCandidates > 0 && blockedCandidates == claudeCandidates {
-		return pluginapi.SchedulerPickResponse{}, &envelopeError{Code: exhaustedErrorCode, Message: exhaustedErrorCode}
-	}
-	return pluginapi.SchedulerPickResponse{Handled: false}, nil
+// These wire types match the negotiated host feature without changing the
+// unrelated v7.2.100 SDK dependency or native C ABI.
+const schedulerFilterV1 = "scheduler_filter_v1"
+
+type filterCandidate struct {
+	ID       string `json:"id"`
+	Provider string `json:"provider"`
 }
 
-func isClaudeRequest(req pluginapi.SchedulerPickRequest) bool {
-	if strings.EqualFold(strings.TrimSpace(req.Provider), "claude") {
-		return true
+type filterRequest struct {
+	Model      string            `json:"model"`
+	Candidates []filterCandidate `json:"candidates"`
+}
+
+type filterResponse struct {
+	ExcludedIDs []string `json:"excluded_ids"`
+}
+
+func (r *pluginRuntime) filter(req filterRequest) (filterResponse, *envelopeError) {
+	response := filterResponse{ExcludedIDs: []string{}}
+	seen := make(map[string]struct{}, len(req.Candidates))
+	for _, candidate := range req.Candidates {
+		_, duplicate := seen[candidate.ID]
+		if candidate.ID == "" || strings.TrimSpace(candidate.ID) != candidate.ID || strings.TrimSpace(candidate.Provider) == "" || duplicate {
+			return response, &envelopeError{Code: "invalid_candidates", Message: "candidate IDs must be nonempty and unique with a provider"}
+		}
+		seen[candidate.ID] = struct{}{}
 	}
-	if strings.TrimSpace(req.Provider) != "" || len(req.Providers) != 1 {
-		return false
+	cfg := r.loadedConfig()
+	if !cfg.Enabled || !isProtectedModel(req.Model, cfg.ProtectedModels) {
+		return response, nil
 	}
-	return strings.EqualFold(strings.TrimSpace(req.Providers[0]), "claude")
+	now := r.now()
+	claude := false
+	for _, candidate := range req.Candidates {
+		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), "claude") {
+			continue
+		}
+		claude = true
+		if r.cache.isBlocked(candidate.ID, now, cfg.CutoffPercentUsed) {
+			response.ExcludedIDs = append(response.ExcludedIDs, candidate.ID)
+		} else {
+			// Native selection happens after this callback. Refresh offered,
+			// eligible credentials when due; never choose an account here.
+			r.queueCandidateRefresh(candidate.ID, cfg, now)
+		}
+	}
+	if claude {
+		r.queueCandidateRefresh("", cfg, now)
+	}
+	return response, nil
 }
 
 func isProtectedModel(model string, protectedModels []string) bool {

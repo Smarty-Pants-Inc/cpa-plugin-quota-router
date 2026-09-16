@@ -46,16 +46,11 @@ func TestBlockedRequestDiscoversReplacement(t *testing.T) {
 	clock.set(startedAt.Add(cfg.PollInterval))
 
 	// The current request still uses the cached decision. Recovery must come
-	// from pick's worker trigger, not a test-only call to pollOnce.
-	if _, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0))); decisionError == nil {
-		t.Fatal("first request must retain the cached block")
-	}
+	// from the filter's worker trigger, not a test-only call to pollOnce.
+	assertExclusions(t, runtime, claudeRequest(candidate("auth-a")), "auth-a")
 	waitFor(t, func() bool { return fetcher.callCount() == 2 })
 	waitForRefreshIdle(t, runtime)
-	response, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0)))
-	if decisionError != nil || response.AuthID != "auth-a" {
-		t.Fatalf("replacement did not recover: response=%#v error=%#v", response, decisionError)
-	}
+	assertExclusions(t, runtime, claudeRequest(candidate("auth-a")))
 	if listCalls, _ := host.counts(); listCalls != 2 {
 		t.Fatalf("discovery calls = %d, want startup plus one request-triggered pass", listCalls)
 	}
@@ -76,10 +71,7 @@ func TestUnsupportedRequestsRetainDiscoveryThrottle(t *testing.T) {
 	for pass := range 2 {
 		clock.set(startedAt.Add(time.Duration(pass+1) * cfg.PollInterval))
 		for range 5 {
-			response, decisionError := runtime.pick(claudeRequest(candidate("runtime-only", 0)))
-			if decisionError != nil || response.AuthID != "runtime-only" {
-				t.Fatalf("unsupported candidate must fail open: response=%#v error=%#v", response, decisionError)
-			}
+			assertExclusions(t, runtime, claudeRequest(candidate("runtime-only")))
 			waitForRefreshIdle(t, runtime)
 		}
 		if calls, gets := host.counts(); calls != pass+2 || gets != 0 {
@@ -102,15 +94,12 @@ func TestUnprotectedRequestsDoNotDiscover(t *testing.T) {
 	waitFor(t, func() bool { calls, _ := host.counts(); return calls == 1 })
 	waitForRefreshIdle(t, runtime)
 	clock.set(startedAt.Add(cfg.PollInterval))
-	for _, request := range []pluginapi.SchedulerPickRequest{
-		claudeModelRequest(defaultProtectedModel+"(high)", candidate("unknown", 0)),
-		claudeModelRequest("unconfigured-alias", candidate("unknown", 0)),
-		{Provider: "codex", Model: defaultProtectedModel, Candidates: []pluginapi.SchedulerAuthCandidate{candidate("unknown", 0)}},
-		{Providers: []string{"claude", "codex"}, Model: defaultProtectedModel, Candidates: []pluginapi.SchedulerAuthCandidate{candidate("unknown", 0)}},
+	for _, request := range []filterRequest{
+		claudeModelRequest(defaultProtectedModel+"(high)", candidate("unknown")),
+		claudeModelRequest("unconfigured-alias", candidate("unknown")),
+		{Model: defaultProtectedModel, Candidates: []filterCandidate{{ID: "unknown", Provider: "codex"}}},
 	} {
-		if response, err := runtime.pick(request); err != nil || response.Handled {
-			t.Fatalf("unprotected request handled: response=%#v error=%#v", response, err)
-		}
+		assertExclusions(t, runtime, request)
 	}
 	waitForRefreshIdle(t, runtime)
 	if calls, gets := host.counts(); calls != 1 || gets != 0 {
@@ -130,7 +119,7 @@ func TestDiscoveryFailureIsThrottledAcrossPruning(t *testing.T) {
 	waitForRefreshIdle(t, runtime)
 	for range 5 {
 		runtime.cache.reconcile(nil)
-		_, _ = runtime.pick(claudeRequest(candidate("unsupported", 0)))
+		_, _ = runtime.filter(claudeRequest(candidate("unsupported")))
 		waitForRefreshIdle(t, runtime)
 	}
 	if calls, _ := host.counts(); calls != 1 {
@@ -147,7 +136,7 @@ func TestDiscoveryFailureIsThrottledAcrossPruning(t *testing.T) {
 	host.listError = nil
 	host.mu.Unlock()
 	clock.set(startedAt.Add(cfg.PollInterval))
-	_, _ = runtime.pick(claudeRequest(candidate("unsupported", 0)))
+	_, _ = runtime.filter(claudeRequest(candidate("unsupported")))
 	waitForRefreshIdle(t, runtime)
 	status = runtime.discoveryStatus()
 	if status.LastSuccessAt != statusTime(clock.now()) || status.LastErrorCategory != "" {
@@ -192,7 +181,7 @@ func TestDiscoveryDoesNotRefreshUnselectedUnchangedAccounts(t *testing.T) {
 	waitFor(t, func() bool { return fetcher.callCount() == 2 })
 	waitForRefreshIdle(t, runtime)
 	clock.set(startedAt.Add(cfg.PollInterval))
-	_, _ = runtime.pick(claudeRequest(candidate("blocked", 0)))
+	_, _ = runtime.filter(claudeRequest(candidate("blocked")))
 	waitForRefreshIdle(t, runtime)
 	if calls, gets := host.counts(); calls != 2 || gets != 2 || fetcher.callCount() != 2 {
 		t.Fatalf("metadata pass became provider sweep: list=%d get=%d fetch=%d", calls, gets, fetcher.callCount())
@@ -218,7 +207,7 @@ func TestConcurrentBlockedRequestsCoalesceDiscovery(t *testing.T) {
 	clock.set(startedAt.Add(cfg.PollInterval))
 	var requests sync.WaitGroup
 	for range 32 {
-		requests.Go(func() { _, _ = runtime.pick(claudeRequest(candidate("auth-a", 0))) })
+		requests.Go(func() { _, _ = runtime.filter(claudeRequest(candidate("auth-a"))) })
 	}
 	requests.Wait()
 	waitForRefreshIdle(t, runtime)

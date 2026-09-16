@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -28,6 +29,13 @@ const (
 var e2eUsageHits atomic.Int64
 
 func TestCLIProxyAPIProcessEndToEnd(t *testing.T) {
+	root, pluginSource, pair := os.Getenv("QUOTA_TEST_HOST_SOURCE"), os.Getenv("QUOTA_TEST_PLUGIN_SOURCE"), os.Getenv("QUOTA_TEST_PAIR")
+	if root == "" && pluginSource == "" && pair == "" {
+		t.Skip("native pair requires exact QUOTA_TEST_HOST_SOURCE, QUOTA_TEST_PLUGIN_SOURCE and QUOTA_TEST_PAIR inputs")
+	}
+	if root == "" || pluginSource == "" { t.Fatal("both exact source directories are required") }
+	switch pair { case "old-old", "new-old", "new-new", "old-new-refused": default: t.Fatal("unknown QUOTA_TEST_PAIR") }
+	e2eUsageHits.Store(0)
 	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		e2eUsageHits.Add(1)
 		if r.Header.Get("anthropic-beta") != anthropicOAuthBeta {
@@ -57,9 +65,13 @@ func TestCLIProxyAPIProcessEndToEnd(t *testing.T) {
 		http.Error(w, "fixture proxy rejects upstream", http.StatusBadGateway)
 	}))
 	defer proxyServer.Close()
+	highProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select { case proxyHits <- "HIGH " + r.Method + " " + r.Host: default: }
+		http.Error(w, "fixture high-priority proxy rejects upstream", http.StatusBadGateway)
+	}))
+	defer highProxy.Close()
 
 	dir := t.TempDir()
-	root := cliProxyAPIModuleDir(t)
 	pluginDir, authDir := filepath.Join(dir, "plugins"), filepath.Join(dir, "auth")
 	if err := os.MkdirAll(pluginDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -77,6 +89,7 @@ func TestCLIProxyAPIProcessEndToEnd(t *testing.T) {
 	}
 	pluginPath := filepath.Join(pluginDir, pluginName+extension)
 	buildPlugin := exec.Command("go", "build", "-buildmode=c-shared", "-ldflags", "-X=main.usageEndpoint="+usageServer.URL, "-o", pluginPath, ".")
+	buildPlugin.Dir = pluginSource
 	if output, errBuild := buildPlugin.CombinedOutput(); errBuild != nil {
 		t.Fatalf("build plugin: %v\n%s", errBuild, output)
 	}
@@ -88,6 +101,12 @@ func TestCLIProxyAPIProcessEndToEnd(t *testing.T) {
 		t.Fatalf("build CLIProxyAPI: %v\n%s", errBuild, output)
 	}
 
+	for _, path := range []string{pluginPath, serverPath} {
+		artifact, err := os.ReadFile(path)
+		if err != nil { t.Fatal(err) }
+		t.Logf("pair=%s platform=%s/%s go=%s artifact=%s sha256=%x", pair, runtime.GOOS, runtime.GOARCH, runtime.Version(), filepath.Base(path), sha256.Sum256(artifact))
+	}
+
 	for i, fixture := range []struct {
 		name  string
 		token string
@@ -95,7 +114,9 @@ func TestCLIProxyAPIProcessEndToEnd(t *testing.T) {
 		{name: "claude-a.json", token: "e2e-token-a"},
 		{name: "claude-b.json", token: "e2e-token-b"},
 	} {
-		body := fmt.Sprintf(`{"type":"claude","email":"e2e-%d@example.com","access_token":%q,"refresh_token":"fixture-refresh","expired":"2099-01-01T00:00:00Z"}`, i, fixture.token)
+		priority, proxy := 0, proxyServer.URL
+		if pair == "new-new" && i == 1 { priority, proxy = 100, highProxy.URL }
+		body := fmt.Sprintf(`{"type":"claude","email":"e2e-%d@example.com","access_token":%q,"refresh_token":"fixture-refresh","expired":"2099-01-01T00:00:00Z","priority":%d,"proxy_url":%q}`, i, fixture.token, priority, proxy)
 		if err := os.WriteFile(filepath.Join(authDir, fixture.name), []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -167,6 +188,19 @@ plugins:
 
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	client := &http.Client{Timeout: 2 * time.Second}
+	if pair == "old-new-refused" {
+		waitForProcessModel(t, client, baseURL, processDone, &processErr, logPath, "claude-sonnet-4-6")
+		if !strings.Contains(readLog(logPath), "scheduler_filter_v1 is required") { t.Fatalf("missing actual negotiation refusal:\n%s", readLog(logPath)) }
+		request, _ := http.NewRequest(http.MethodGet, baseURL+managementStatusFullPath, nil)
+		request.Header.Set("Authorization", "Bearer "+e2eManagementKey)
+		response, err := client.Do(request)
+		if err != nil { t.Fatal(err) }
+		body := readResponseBody(t, response)
+		if response.StatusCode != http.StatusNotFound { t.Fatalf("refused plugin exposed status: %d %s", response.StatusCode, body) }
+		time.Sleep(250*time.Millisecond)
+		if e2eUsageHits.Load() != 0 { t.Fatal("refused plugin started provider worker") }
+		return
+	}
 	status := waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status cutoffStatusResponse) bool {
 		if !status.Enabled || len(status.ProtectedModels) != 1 || status.ProtectedModels[0] != defaultProtectedModel || status.CutoffPercentUsed != 50 || len(status.Accounts) != 2 {
 			return false
@@ -237,7 +271,9 @@ drainProxyHits:
 		t.Fatalf("blocked request refreshed usage before reset: hits=%d, want %d", hits, startupUsageHits)
 	}
 
-	patch := []byte(`{"cutoff-percent-used":90}`)
+	cutoff := 90
+	if pair == "new-new" { cutoff = 60 }
+	patch := []byte(fmt.Sprintf(`{"cutoff-percent-used":%d}`, cutoff))
 	request, err := http.NewRequest(http.MethodPatch, baseURL+"/v0/management/plugins/"+pluginName+"/config", bytes.NewReader(patch))
 	if err != nil {
 		t.Fatal(err)
@@ -254,11 +290,11 @@ drainProxyHits:
 	}
 
 	waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status cutoffStatusResponse) bool {
-		if status.CutoffPercentUsed != 90 || len(status.Accounts) != 2 {
+		if status.CutoffPercentUsed != float64(cutoff) || len(status.Accounts) != 2 {
 			return false
 		}
 		for _, account := range status.Accounts {
-			if !account.Known || account.Blocked {
+			if !account.Known || account.WeeklyPercentUsed == nil || account.Blocked != (*account.WeeklyPercentUsed >= float64(cutoff)) {
 				return false
 			}
 		}
@@ -274,20 +310,45 @@ drainProxyHits:
 		if !strings.Contains(hit, "api.anthropic.com:443") {
 			t.Fatalf("unexpected upstream proxy target: %s", hit)
 		}
+		if pair == "new-new" && strings.HasPrefix(hit, "HIGH ") { t.Fatalf("excluded high-tier account reached provider: %s", hit) }
 	case <-time.After(3 * time.Second):
 		t.Fatalf("eligible request never reached upstream proxy: %s\nserver log:\n%s", eligibleResponse, readLog(logPath))
 	}
 	waitFor(t, func() bool { return e2eUsageHits.Load() > startupUsageHits })
-}
-
-func cliProxyAPIModuleDir(t *testing.T) string {
-	t.Helper()
-	cmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/router-for-me/CLIProxyAPI/v7")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("resolve CLIProxyAPI module: %v\n%s", err, output)
+	if pair == "new-new" {
+	drainEligible:
+		for {
+			select {
+			case hit := <-proxyHits:
+				if strings.HasPrefix(hit, "HIGH ") { t.Fatalf("retry resurrected excluded account: %s", hit) }
+			default: break drainEligible
+			}
+		}
+		for _, enabled := range []bool{false, true} {
+			raw := fmt.Sprintf(`{"enabled":%t}`, enabled)
+			req, _ := http.NewRequest(http.MethodPatch, baseURL+"/v0/management/plugins/"+pluginName+"/enabled", strings.NewReader(raw))
+			req.Header.Set("Authorization", "Bearer "+e2eManagementKey)
+			req.Header.Set("Content-Type", "application/json")
+			res, err := client.Do(req)
+			if err != nil { t.Fatal(err) }
+			body := readResponseBody(t, res)
+			if res.StatusCode != http.StatusOK { t.Fatalf("toggle plugin: %d %s", res.StatusCode, body) }
+			if !enabled {
+				waitFor(t, func() bool {
+					statusReq, _ := http.NewRequest(http.MethodGet, baseURL+managementStatusFullPath, nil)
+					statusReq.Header.Set("Authorization", "Bearer "+e2eManagementKey)
+					statusRes, err := client.Do(statusReq)
+					if err != nil { return false }
+					readResponseBody(t, statusRes)
+					return statusRes.StatusCode == http.StatusNotFound
+				})
+			} else {
+				waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status cutoffStatusResponse) bool {
+					return status.Enabled && status.CutoffPercentUsed == 60 && len(status.Accounts) == 2
+				})
+			}
+		}
 	}
-	return strings.TrimSpace(string(output))
 }
 
 func unusedTCPPort(t *testing.T) int {

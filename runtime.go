@@ -27,6 +27,7 @@ type pluginRuntime struct {
 	refreshMu         sync.Mutex
 	config            atomic.Pointer[pluginConfig]
 	quiesced          atomic.Bool
+	filterNegotiated  atomic.Bool
 	cache             quotaCache
 	host              hostClient
 	fetch             usageFetcher

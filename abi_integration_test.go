@@ -31,6 +31,7 @@ typedef int (*init_fn)(host_api*, plugin_api*);
 static _Atomic int response_mode = 1;
 static _Atomic int oversized_freed;
 static _Atomic int malformed_freed;
+static _Atomic int host_calls;
 
 static int copy_response(cliproxy_buffer* response, const char* text, size_t len) {
 	response->ptr = malloc(len);
@@ -42,6 +43,7 @@ static int copy_response(cliproxy_buffer* response, const char* text, size_t len
 
 static int host_call(void* ctx, const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
 	(void)ctx; (void)request; (void)request_len;
+	atomic_fetch_add(&host_calls, 1);
 	if (method == NULL || response == NULL) return 1;
 	response->ptr = NULL;
 	response->len = 0;
@@ -118,6 +120,12 @@ int main(int argc, char** argv) {
 	char register_method[] = "plugin.register";
 	uint8_t empty_config[] = "{}";
 	CHECK(plugin.call(register_method, empty_config, 2, &response) == 0, 16);
+	const char unsupported[] = "{\"ok\":false,\"error\":{\"code\":\"unsupported_host\",\"message\":\"scheduler_filter_v1 is required\"}}";
+	CHECK(response.len == sizeof(unsupported) - 1 && memcmp(response.ptr, unsupported, response.len) == 0, 23);
+	free_plugin_response(&plugin, &response);
+	CHECK(atomic_load(&host_calls) == 0, 24);
+	uint8_t supported_config[] = "{\"schema_version\":6,\"host_features\":[\"scheduler_filter_v1\"]}";
+	CHECK(plugin.call(register_method, supported_config, sizeof(supported_config) - 1, &response) == 0, 25);
 	free_plugin_response(&plugin, &response);
 	CHECK(wait_flag(&oversized_freed), 17);
 
@@ -129,11 +137,13 @@ int main(int argc, char** argv) {
 
 	atomic_store(&response_mode, 2);
 	char reconfigure_method[] = "plugin.reconfigure";
-	CHECK(plugin.call(reconfigure_method, empty_config, 2, &response) == 0, 18);
+	CHECK(plugin.call(reconfigure_method, supported_config, sizeof(supported_config) - 1, &response) == 0, 18);
 	free_plugin_response(&plugin, &response);
-	char scheduler_method[] = "scheduler.pick";
-	uint8_t scheduler_request[] = "{\"Provider\":\"claude\",\"Providers\":[\"claude\"],\"Model\":\"claude-fable-5\",\"Candidates\":[{\"ID\":\"auth-a\",\"Provider\":\"claude\"}]}";
+	char scheduler_method[] = "scheduler.filter";
+	uint8_t scheduler_request[] = "{\"model\":\"claude-fable-5\",\"candidates\":[{\"id\":\"auth-a\",\"provider\":\"claude\"}]}";
 	CHECK(plugin.call(scheduler_method, scheduler_request, sizeof(scheduler_request) - 1, &response) == 0, 19);
+	const char no_exclusions[] = "{\"ok\":true,\"result\":{\"excluded_ids\":[]}}";
+	CHECK(response.len == sizeof(no_exclusions) - 1 && memcmp(response.ptr, no_exclusions, response.len) == 0, 26);
 	free_plugin_response(&plugin, &response);
 	CHECK(wait_flag(&malformed_freed), 20);
 

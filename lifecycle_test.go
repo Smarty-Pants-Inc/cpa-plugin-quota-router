@@ -36,9 +36,9 @@ func TestQuiesceJoinsHostCallbackAndStopsAdmission(t *testing.T) {
 		t.Fatal("host callback did not start")
 	}
 
-	// A callback stuck in the worker must not turn pick into host I/O.
+	// A callback stuck in the worker must not turn filtering into host I/O.
 	picked := make(chan struct{})
-	go func() { _, _ = runtime.pick(claudeRequest(candidate("unknown", 0))); close(picked) }()
+	go func() { _, _ = runtime.filter(claudeRequest(candidate("unknown"))); close(picked) }()
 	select {
 	case <-picked:
 	case <-time.After(time.Second):
@@ -48,9 +48,7 @@ func TestQuiesceJoinsHostCallbackAndStopsAdmission(t *testing.T) {
 	go func() { runtime.shutdown(); close(done) }()
 	waitFor(t, runtime.quiesced.Load)
 	runtime.cache.recordSuccess("blocked", 80, time.Now().Add(time.Hour), time.Now())
-	if _, err := runtime.pick(claudeRequest(candidate("blocked", 0))); err == nil {
-		t.Fatal("quiesce bypassed cached quota while the host can still route to the old library")
-	}
+	assertExclusions(t, runtime, claudeRequest(candidate("blocked")), "blocked")
 	select {
 	case <-done:
 		t.Fatal("quiesce returned while host callback still owned resources")
@@ -80,7 +78,7 @@ func TestQuiesceRPCResumesOnlyOnExplicitReconfigure(t *testing.T) {
 	previous := activeRuntime
 	activeRuntime = runtime
 	defer func() { runtime.shutdown(); activeRuntime = previous }()
-	if _, err := handleMethod("plugin.register", []byte("{}")); err != nil {
+	if _, err := handleMethod("plugin.register", negotiatedLifecycle(t, "")); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -108,7 +106,7 @@ func TestQuiesceRPCResumesOnlyOnExplicitReconfigure(t *testing.T) {
 	}
 	fetcher := &fakeFetcher{}
 	runtime.fetch = fetcher.fetch // Worker is joined; no concurrent replacement.
-	if _, err := handleMethod("plugin.reconfigure", []byte("{}")); err != nil {
+	if _, err := handleMethod("plugin.reconfigure", negotiatedLifecycle(t, "")); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool { calls, _ := host.counts(); return calls == 2 })

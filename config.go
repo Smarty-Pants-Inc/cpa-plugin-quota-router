@@ -15,7 +15,9 @@ import (
 )
 
 type lifecycleRequest struct {
-	ConfigYAML []byte `json:"config_yaml"`
+	SchemaVersion uint32   `json:"schema_version,omitempty"`
+	ConfigYAML    []byte   `json:"config_yaml"`
+	HostFeatures  []string `json:"host_features,omitempty"`
 }
 
 type rawPluginConfig struct {
@@ -41,8 +43,8 @@ type registration struct {
 }
 
 type registrationCapabilities struct {
-	Scheduler     bool `json:"scheduler"`
-	ManagementAPI bool `json:"management_api"`
+	SchedulerFilterV1 bool `json:"scheduler_filter_v1"`
+	ManagementAPI     bool `json:"management_api"`
 }
 
 type managementRegistrationResponse struct {
@@ -168,7 +170,7 @@ func pluginRegistration() registration {
 				{
 					Name:        "poll-interval",
 					Type:        pluginapi.ConfigFieldTypeString,
-					Description: "Minimum interval for request-triggered metadata discovery and selected-account usage refresh. Default: 5m.",
+					Description: "Minimum interval for request-triggered metadata discovery and offered-account usage refresh. Default: 5m.",
 				},
 				{
 					Name:        "request-timeout",
@@ -177,6 +179,6 @@ func pluginRegistration() registration {
 				},
 			},
 		},
-		Capabilities: registrationCapabilities{Scheduler: true, ManagementAPI: true},
+		Capabilities: registrationCapabilities{SchedulerFilterV1: true, ManagementAPI: true},
 	}
 }

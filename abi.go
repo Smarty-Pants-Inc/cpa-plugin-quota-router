@@ -39,6 +39,7 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -116,18 +117,35 @@ func cliproxyPluginShutdown() {
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
+		var lifecycle lifecycleRequest
+		if len(request) > 0 {
+			if err := json.Unmarshal(request, &lifecycle); err != nil {
+				return nil, fmt.Errorf("decode lifecycle request: %w", err)
+			}
+		}
+		if !slices.Contains(lifecycle.HostFeatures, schedulerFilterV1) {
+			// On capability loss, join existing work too. Initial refusal has
+			// no worker or callbacks. Never start first and negotiate later.
+			activeRuntime.filterNegotiated.Store(false)
+			activeRuntime.shutdown()
+			return errorEnvelope("unsupported_host", "scheduler_filter_v1 is required"), nil
+		}
 		cfg, err := decodeLifecycleConfig(request)
 		if err != nil {
 			return nil, err
 		}
 		activeRuntime.applyConfig(cfg)
+		activeRuntime.filterNegotiated.Store(true)
 		return okEnvelope(pluginRegistration())
-	case pluginabi.MethodSchedulerPick:
-		var req pluginapi.SchedulerPickRequest
-		if err := json.Unmarshal(request, &req); err != nil {
-			return nil, fmt.Errorf("decode scheduler request: %w", err)
+	case "scheduler.filter":
+		if !activeRuntime.filterNegotiated.Load() {
+			return errorEnvelope("unsupported_host", "scheduler_filter_v1 is required"), nil
 		}
-		response, decisionError := activeRuntime.pick(req)
+		var req filterRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return nil, fmt.Errorf("decode filter request: %w", err)
+		}
+		response, decisionError := activeRuntime.filter(req)
 		if decisionError != nil {
 			return errorEnvelope(decisionError.Code, decisionError.Message), nil
 		}

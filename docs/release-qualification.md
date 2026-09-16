@@ -1,8 +1,9 @@
 # Exact-pair release qualification
 
 A plugin version, mapped filename, successful compilation and tested native pair
-are different facts. The default process fixture builds the v7.2.100 SDK module;
-it does not establish compatibility with every newer host. The historical gateway
+are different facts. The process fixture now requires explicit host/plugin source
+paths and a compatibility-pair label; an unset fixture is skipped. The retained
+v7.2.100 SDK dependency is not the native host input. The historical gateway
 `4b5f1eab25fca4b3815369a826e958e7c070a69e` and its tool-prefix diagnostic remain
 separate evidence, not a current release destination.
 
@@ -12,8 +13,8 @@ The gateway/plugin integrator records one immutable candidate with:
 
 - Plugin repository, exact commit/tree, version, unchanged go.mod/go.sum digests.
 - Gateway repository, exact commit/tree/version and source/archive digest. The
-  maintained-host proposal is in [host-contract.md](host-contract.md); it is not
-  yet an accepted or patched pair.
+  frozen host implementation input is in [host-contract.md](host-contract.md).
+  Source intake is not native pair acceptance.
 - Exact Go patch version, `CGO_ENABLED`, C compiler/linker versions and native
   OS/architecture. Record Linux libc/minimum runtime requirements, or the Darwin
   deployment target / Windows runtime closure as applicable.
@@ -43,8 +44,9 @@ coverage limit instead of calling it whole-process native race coverage.
 Then receive native load/init/call/free/quiesce/reconfigure/shutdown results for
 the **same packaged library** with the exact selected gateway. Test status,
 quota exhaustion, privacy, management authentication negatives and lifecycle
-behavior with synthetic inputs. The proposed eligibility pair needs the full
-contract cases in `host-contract.md` before it is supported.
+behavior with synthetic inputs. The implemented eligibility pair still needs the
+full contract cases in `host-contract.md` before it is supported. The loopback
+process fixture overrides the provider endpoint; it is not the released library.
 
 The packaging matrix remains Linux amd64/arm64, Darwin amd64/arm64 and Windows
 amd64. Record each platform as compiled, native-qualified, failed, skipped or
