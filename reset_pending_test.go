@@ -15,8 +15,41 @@ import (
 
 const resetOutageMessage = "quota host unavailable; routing on unverified post-reset seats"
 
-// These tests only use interfaces present on 37c418d4 so changed behavior can
+// These tests only use interfaces present on 874129e4 so changed behavior can
 // be demonstrated on that base, not merely by a compilation failure.
+const noVerifiedSeatMessage = "no verified seat: all candidate seats await a post-reset quota read; quota host error: "
+
+func assertNoVerifiedSeatWarnings(t *testing.T, host *fakeHost, want int, category string, seats []string, failures map[string]string) {
+	t.Helper()
+	host.mu.Lock()
+	logs := append([]string(nil), host.logs...)
+	host.mu.Unlock()
+	count := 0
+	for _, raw := range logs {
+		var entry struct {
+			Level   string `json:"level"`
+			Message string `json:"message"`
+			Fields  struct {
+				Seats []string          `json:"seats"`
+				Error map[string]string `json:"error"`
+			} `json:"fields"`
+		}
+		if err := json.Unmarshal([]byte(raw), &entry); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(entry.Message, noVerifiedSeatMessage) {
+			continue
+		}
+		count++
+		if entry.Level != "warn" || entry.Message != noVerifiedSeatMessage+category ||
+			!reflect.DeepEqual(entry.Fields.Error, failures) || !reflect.DeepEqual(entry.Fields.Seats, seats) {
+			t.Fatalf("no-seat WARN must contain only safe categories and stable seat ordering: %s", raw)
+		}
+	}
+	if count != want {
+		t.Fatalf("no-seat WARN count = %d, want %d; logs:\n%s", count, want, strings.Join(logs, "\n"))
+	}
+}
 func assertResetOutageWarnings(t *testing.T, host *fakeHost, want int, failures map[string]string) {
 	t.Helper()
 	host.mu.Lock()
@@ -180,7 +213,7 @@ func newResetPendingPair(t *testing.T, second fetchReply) *staleResetFixture {
 	return f
 }
 
-func TestResetPendingAllHostDownFallbackWarnsOncePerPick(t *testing.T) {
+func TestResetPendingAllHostDownFailsClosedWarnsOncePerPick(t *testing.T) {
 	for _, failure := range []string{pollErrorNetwork, "auth_get", "auth_list"} {
 		t.Run(failure, func(t *testing.T) {
 			f := newResetPendingPair(t, fetchReply{category: pollErrorNetwork})
@@ -193,19 +226,17 @@ func TestResetPendingAllHostDownFallbackWarnsOncePerPick(t *testing.T) {
 			}
 			f.host.mu.Unlock()
 			for pick := 1; pick <= 2; pick++ {
-				// Unknown policy retains the usual priority/lexical ordering.
-				priorityB, wantID := 10, "auth-a"
-				if pick == 2 {
-					priorityB, wantID = 100, "auth-b"
+				// Neither priority nor lexical ordering can enable an unverified seat.
+				response, decisionError := f.runtime.pick(claudeRequest(candidate("auth-b", pick*100), candidate("auth-a", 10)))
+				if response.Handled || response.AuthID != "" || decisionError == nil ||
+					decisionError.Code != exhaustedErrorCode || decisionError.Message != noVerifiedSeatMessage+failure {
+					t.Fatalf("all-host-down must fail closed: response=%#v error=%#v", response, decisionError)
 				}
-				response, decisionError := f.runtime.pick(claudeRequest(candidate("auth-b", priorityB), candidate("auth-a", 10)))
-				if decisionError != nil || !response.Handled || response.AuthID != wantID {
-					t.Fatalf("all-host-down fallback pick = %#v error=%#v", response, decisionError)
-				}
-				assertResetOutageWarnings(t, f.host, pick, map[string]string{"auth-a": failure, "auth-b": failure})
+				assertNoVerifiedSeatWarnings(t, f.host, pick, failure, []string{"auth-a", "auth-b"}, map[string]string{"auth-a": failure, "auth-b": failure})
+				assertResetOutageWarnings(t, f.host, 0, nil)
 				for _, id := range []string{"auth-a", "auth-b"} {
 					if sample := f.runtime.cache.snapshot(id); !sample.blocked(f.clock.now(), f.cfg.CutoffPercentUsed) || sample.LastErrorCategory != failure {
-						t.Fatalf("outage fallback must not clear cached block: id=%s sample=%#v", id, sample)
+						t.Fatalf("failed read must not clear cached block: id=%s sample=%#v", id, sample)
 					}
 				}
 			}
@@ -221,6 +252,126 @@ func TestResetPendingAllHostDownFallbackWarnsOncePerPick(t *testing.T) {
 	}
 }
 
+func TestResetPendingHostRecoveryNextRetryPickRequiresSuccessfulRead(t *testing.T) {
+	for _, failure := range []string{pollErrorNetwork, pollErrorAuthGet, pollErrorAuthList} {
+		t.Run(failure, func(t *testing.T) {
+			f := newResetPendingPair(t, fetchReply{category: pollErrorNetwork})
+			f.host.mu.Lock()
+			if failure == pollErrorAuthGet {
+				f.host.getErrors = map[string]error{"index-a": errors.New("fixture host down"), "index-b": errors.New("fixture host down")}
+			}
+			if failure == pollErrorAuthList {
+				f.host.listError = errors.New("fixture host down")
+			}
+			f.host.mu.Unlock()
+			request := claudeRequest(candidate("auth-b", 100), candidate("auth-a", 1))
+			response, decisionError := f.runtime.pick(request)
+			if response.Handled || response.AuthID != "" || decisionError == nil ||
+				decisionError.Code != exhaustedErrorCode || decisionError.Message != noVerifiedSeatMessage+failure {
+				t.Fatalf("outage must fail closed before recovery: response=%#v error=%#v", response, decisionError)
+			}
+			assertNoVerifiedSeatWarnings(t, f.host, 1, failure, []string{"auth-a", "auth-b"}, map[string]string{"auth-a": failure, "auth-b": failure})
+			waitFor(t, f.idle)
+			f.host.mu.Lock()
+			f.host.getErrors, f.host.listError = nil, nil
+			f.host.mu.Unlock()
+			low := fetchReply{result: usageResult{WeeklyPercentUsed: 5, ResetAt: f.start.Add(7 * 24 * time.Hour)}}
+			f.fetcher.mu.Lock()
+			f.fetcher.replies["token-a"] = []fetchReply{low}
+			f.fetcher.replies["token-b"] = []fetchReply{low}
+			f.fetcher.mu.Unlock()
+			// Recovery does not bypass the existing post-failure retry throttle.
+			// The very next pick at the retry boundary must reread before routing.
+			f.clock.set(f.clock.now().Add(f.cfg.PollInterval))
+			response, decisionError = f.runtime.pick(request)
+			if decisionError != nil || !response.Handled || response.AuthID != "auth-b" {
+				t.Fatalf("successful recovered read must enable next pick: response=%#v error=%#v", response, decisionError)
+			}
+			waitFor(t, f.idle)
+			for _, id := range []string{"auth-a", "auth-b"} {
+				sample := f.runtime.cache.snapshot(id)
+				if !sample.HasSample || sample.WeeklyPercentUsed != 5 || !sample.SampledAt.Equal(f.clock.now()) ||
+					sample.blocked(f.clock.now(), f.cfg.CutoffPercentUsed) || sample.LastErrorCategory != "" {
+					t.Fatalf("recovered selection requires a fresh successful read: id=%s sample=%#v", id, sample)
+				}
+			}
+			gets, fetches := 6, 6
+			if failure == pollErrorAuthGet {
+				fetches = 4
+			}
+			if failure == pollErrorAuthList {
+				gets, fetches = 4, 4
+			}
+			f.assertCounts(t, gets, fetches)
+			assertNoVerifiedSeatWarnings(t, f.host, 1, failure, []string{"auth-a", "auth-b"}, map[string]string{"auth-a": failure, "auth-b": failure})
+			assertResetOutageWarnings(t, f.host, 0, nil)
+		})
+	}
+}
+
+func TestResetPendingInvalidLocalCredentialsFailClosed(t *testing.T) {
+	for _, raw := range []string{
+		`{"type":"claude",`,
+		`{"type":42,"access_token":"must-not-leak"}`,
+		`{"type":"claude","access_token":42}`,
+		`{"type":"other","access_token":"must-not-leak"}`,
+		`null`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			f := newResetPendingPair(t, fetchReply{category: pollErrorNetwork})
+			f.host.mu.Lock()
+			f.host.authJSON["index-a"] = json.RawMessage(raw)
+			f.host.authJSON["index-b"] = json.RawMessage(raw)
+			f.host.mu.Unlock()
+			const category = "invalid local credential"
+			for pick := 1; pick <= 2; pick++ {
+				response, decisionError := f.runtime.pick(claudeRequest(candidate("auth-a", 100), candidate("auth-b", 1)))
+				if response.Handled || response.AuthID != "" || decisionError == nil ||
+					decisionError.Code != exhaustedErrorCode || decisionError.Message != noVerifiedSeatMessage+category {
+					t.Fatalf("invalid local credentials must fail closed with their own category: response=%#v error=%#v", response, decisionError)
+				}
+				assertNoVerifiedSeatWarnings(t, f.host, pick, category, []string{"auth-a", "auth-b"}, map[string]string{"auth-a": category, "auth-b": category})
+				for _, id := range []string{"auth-a", "auth-b"} {
+					sample := f.runtime.cache.snapshot(id)
+					if sample.LastErrorCategory != category || !sample.blocked(f.clock.now(), f.cfg.CutoffPercentUsed) {
+						t.Fatalf("local validation must retain the block and must not masquerade as auth_get: id=%s sample=%#v", id, sample)
+					}
+				}
+			}
+			assertResetOutageWarnings(t, f.host, 0, nil)
+			if strings.Contains(f.host.logText(), "must-not-leak") {
+				t.Fatal("local credential data leaked into logs")
+			}
+			// Both host get calls succeed; no usage fetch is attempted for bad files.
+			f.assertNoRefresh(t, 4, 2)
+		})
+	}
+}
+
+func TestResetPendingNoSeatErrorUsesSchedulerEnvelope(t *testing.T) {
+	f := newResetPendingPair(t, fetchReply{category: pollErrorNetwork})
+	previous := activeRuntime
+	activeRuntime = f.runtime
+	t.Cleanup(func() { activeRuntime = previous })
+	request, err := json.Marshal(claudeRequest(candidate("auth-a", 10), candidate("auth-b", 100)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := handleMethod("scheduler.pick", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response envelope
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.OK || len(response.Result) != 0 || response.Error == nil ||
+		response.Error.Code != exhaustedErrorCode || response.Error.Message != noVerifiedSeatMessage+pollErrorNetwork {
+		t.Fatalf("scheduler must return existing typed no-seat envelope, not a selected seat: %s", raw)
+	}
+	assertNoVerifiedSeatWarnings(t, f.host, 1, pollErrorNetwork, []string{"auth-a", "auth-b"}, map[string]string{"auth-a": pollErrorNetwork, "auth-b": pollErrorNetwork})
+}
+
 func TestResetPendingMixedFetchFailureAndFreshExhaustedNeverFallback(t *testing.T) {
 	f := newResetPendingPair(t, fetchReply{result: usageResult{WeeklyPercentUsed: 100, ResetAt: time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)}})
 	response, decisionError := f.runtime.pick(claudeRequest(candidate("auth-a", 100), candidate("auth-b", 1)))
@@ -230,6 +381,7 @@ func TestResetPendingMixedFetchFailureAndFreshExhaustedNeverFallback(t *testing.
 	waitFor(t, f.idle)
 	f.assertCounts(t, 4, 4)
 	assertResetOutageWarnings(t, f.host, 0, nil)
+	assertNoVerifiedSeatWarnings(t, f.host, 0, "", nil, nil)
 }
 
 func TestResetPendingWaitIsBoundedAndUnfinishedReadCannotFallback(t *testing.T) {
@@ -262,6 +414,7 @@ func TestResetPendingWaitIsBoundedAndUnfinishedReadCannotFallback(t *testing.T) 
 	}
 	f.assertCounts(t, 2, 1)
 	assertResetOutageWarnings(t, f.host, 0, nil)
+	assertNoVerifiedSeatWarnings(t, f.host, 1, "read_pending", []string{"auth-a"}, map[string]string{"auth-a": "read_pending"})
 	unblock()
 	f.release()
 }
@@ -278,4 +431,5 @@ func TestResetPendingMissingCredentialDoesNotTriggerOutageFallback(t *testing.T)
 		t.Fatalf("missing credential must remain blocked: %#v", sample)
 	}
 	assertResetOutageWarnings(t, f.host, 0, nil)
+	assertNoVerifiedSeatWarnings(t, f.host, 1, pollErrorMissingToken, []string{"auth-a"}, map[string]string{"auth-a": pollErrorMissingToken})
 }

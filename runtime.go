@@ -222,28 +222,33 @@ func resetReadTimeout(cfg pluginConfig) time.Duration {
 	return min(cfg.RequestTimeout, 2*time.Second)
 }
 
-// A completed post-reset host/fetch failure can support the stated outage
-// exception. Pending work, cancellation, and unusable local credentials cannot.
+// Report only safe categories for the fail-closed post-reset no-seat error.
+// Empty means the seat is no longer reset-pending (e.g. a fresh exhausted read).
+// Incomplete work is not evidence of a host outage, but still cannot enable it.
 func (r *pluginRuntime) resetPendingFailure(authID string, now time.Time, cutoff float64) string {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
 	_, pending := r.pendingIDs[authID]
 	_, inFlight := r.inFlightIDs[authID]
-	if r.pendingAll || r.inFlightAll || pending || inFlight {
+	sample := r.cache.snapshot(authID)
+	if !sample.resetPending(now, cutoff) {
 		return ""
 	}
-	sample := r.cache.snapshot(authID)
-	if !sample.resetPending(now, cutoff) || sample.LastAttemptAt.Before(sample.ResetAt) {
-		return ""
+	if r.pendingAll || r.inFlightAll || pending || inFlight {
+		return "read_pending"
+	}
+	if sample.LastAttemptAt.Before(sample.ResetAt) {
+		return "unverified"
 	}
 	switch sample.LastErrorCategory {
 	case pollErrorAuthList, pollErrorAuthGet, pollErrorTimeout, pollErrorNetwork,
 		pollErrorUnauthorized, pollErrorForbidden, pollErrorRateLimited,
 		pollErrorServer, pollErrorHTTP, pollErrorRead, pollErrorInvalidJSON,
-		pollErrorInvalidWeekly, pollErrorBodyTooLarge:
+		pollErrorInvalidWeekly, pollErrorBodyTooLarge, pollErrorMissingToken, pollErrorCancelled,
+		pollErrorInvalidCredential:
 		return sample.LastErrorCategory
 	default:
-		return ""
+		return "unverified"
 	}
 }
 
@@ -367,12 +372,14 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 		return
 	}
 	var credential claudeCredential
-	if json.Unmarshal(rawAuth, &credential) != nil {
-		r.recordPollFailure(auth.ID, pollErrorAuthGet)
+	// A successful host callback can still return an invalid local file.
+	// Decode/type validation failures are not host outages.
+	if json.Unmarshal(rawAuth, &credential) != nil || !strings.EqualFold(strings.TrimSpace(credential.Type), "claude") {
+		r.recordPollFailure(auth.ID, pollErrorInvalidCredential)
 		return
 	}
 	token := strings.TrimSpace(credential.AccessToken)
-	if !strings.EqualFold(strings.TrimSpace(credential.Type), "claude") || token == "" {
+	if token == "" {
 		r.recordPollFailure(auth.ID, pollErrorMissingToken)
 		return
 	}

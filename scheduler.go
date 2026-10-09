@@ -109,31 +109,39 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 			return pluginapi.SchedulerPickResponse{AuthID: selected.ID, Handled: true}, nil
 		}
 
-		// Owner's stated quota-host OUTAGE exception: only when EVERY candidate
-		// is reset-pending and fresh reads failed with host/fetch errors, treat
-		// them as unknown for this pick (the existing unknown policy is eligible).
-		// This gateway is the fleet's only model path; upstream 429s are cooled
-		// by the gateway. Never apply this to a successful exhausted reading or
-		// unfinished work, and never erase the cached block on a failed read.
+		// Fail closed: all seats being reset-pending while the quota host is
+		// down is a narrow window because accounts reset at different times.
+		// An unverified post-reset seat must never be used, even in an outage.
+		// Reuse the existing typed no-seat path; successful exhausted reads
+		// retain the normal exhausted error below, never becoming eligible.
 		if len(resetPending) == claudeCandidates {
 			failures := make(map[string]string, len(ids))
+			categories := make(map[string]struct{})
 			for _, candidate := range resetPending {
 				category := r.resetPendingFailure(candidate.ID, now, cfg.CutoffPercentUsed)
 				if category == "" {
 					break
 				}
 				failures[candidate.ID] = category
+				categories[category] = struct{}{}
 			}
 			if len(failures) == len(ids) {
-				for _, candidate := range resetPending {
-					selected = preferredCandidate(selected, candidate)
+				safeCategories := make([]string, 0, len(categories))
+				for category := range categories {
+					safeCategories = append(safeCategories, category)
+				}
+				sort.Strings(safeCategories)
+				decisionError := &envelopeError{
+					Code: exhaustedErrorCode,
+					Message: "no verified seat: all candidate seats await a post-reset quota read; quota host error: " +
+						strings.Join(safeCategories, ", "),
 				}
 				sort.Strings(ids)
-				r.log("warn", "quota host unavailable; routing on unverified post-reset seats", map[string]any{
+				r.log("warn", decisionError.Message, map[string]any{
 					"seats": ids,
 					"error": failures,
 				})
-				return pluginapi.SchedulerPickResponse{AuthID: selected.ID, Handled: true}, nil
+				return pluginapi.SchedulerPickResponse{}, decisionError
 			}
 		}
 	}
