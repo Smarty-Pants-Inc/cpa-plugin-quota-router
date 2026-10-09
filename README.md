@@ -18,6 +18,7 @@ plugins:
       protected-models: [claude-fable-5]
       cutoff-percent-used: 50
       poll-interval: 5m
+      blocked-refresh-interval: 6h
       request-timeout: 10s
 ```
 
@@ -33,17 +34,18 @@ Published releases include Darwin (`amd64`, `arm64`), Linux (`amd64`, `arm64`), 
 | --- | --- | --- |
 | `protected-models` | `[claude-fable-5]` | Exact, case-insensitive model IDs governed by the cutoff. |
 | `cutoff-percent-used` | `50` | Blocks an eligible account at or above this seven-day utilization percentage. |
-| `poll-interval` | `5m` | Minimum cache age before a protected request queues another asynchronous refresh. |
+| `poll-interval` | `5m` | Minimum cache age before a protected request queues another asynchronous refresh; a passed reset allows an immediate first-use refresh. |
+| `blocked-refresh-interval` | `6h` | Minimum time since the last sample or refresh attempt before a protected request rechecks a blocked account. `0` disables this backstop. |
 | `request-timeout` | `10s` | Timeout for the provider usage request, expressed as a Go duration. |
 
 ## Behavior
 
 - Refreshes enabled physical Claude OAuth credentials when the worker starts; startup reconfiguration retries discovery only while the cache is empty. There is no time-driven polling.
 - When a protected-model request selects an account whose cached usage is at least `poll-interval` old, queues one asynchronous refresh for that account while routing the current request from memory.
-- Coalesces concurrent refreshes, and does not refresh a known blocked account again before its reported reset time.
+- Coalesces concurrent refreshes. A blocked account remains excluded before its reported reset, but protected requests queue a re-read after `blocked-refresh-interval` since its last sample or refresh attempt. This backstop can detect an early provider reset; it is not a continuous polling timer.
 - A rejection-only design cannot enforce a pre-exhaustion cutoff: the rejection arrives only after the hard limit is reached.
 - Applies only to exact, case-insensitive `protected-models` matches.
-- Blocks an account at or above `cutoff-percent-used`; unknown or reset-expired quota state fails open while a refresh is queued.
+- Blocks an account at or above `cutoff-percent-used`; unknown or reset-expired quota state fails open. First use after a reset queues a refresh even if the pre-reset sample is younger than `poll-interval`; subsequent failed attempts remain rate-limited.
 - Never changes auth files or CLIProxyAPI's permanent disabled state.
 - Exposes authenticated status at `GET /v0/management/plugins/quota-router/status`.
 

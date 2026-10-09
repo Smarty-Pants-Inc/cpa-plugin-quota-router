@@ -30,6 +30,8 @@ const (
 	pollErrorRead            = "read_error"
 )
 
+const defaultBlockedRefreshInterval = 6 * time.Hour
+
 var pluginVersion = "0.5.0"
 
 // Variable only so the C-shared integration test can inject a local fixture.

@@ -165,7 +165,7 @@ func (r *pluginRuntime) queueCandidateRefresh(authID string, cfg pluginConfig, n
 		r.refreshMu.Unlock()
 		return
 	}
-	if !r.cache.claimRefresh(authID, now, cfg.CutoffPercentUsed, cfg.PollInterval) {
+	if !r.cache.claimRefresh(authID, now, cfg.CutoffPercentUsed, cfg.PollInterval, cfg.BlockedRefreshInterval) {
 		r.refreshMu.Unlock()
 		return
 	}

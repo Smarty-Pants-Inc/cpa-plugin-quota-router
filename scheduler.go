@@ -73,6 +73,7 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 		claudeCandidates++
 		if r.cache.isBlocked(candidate.ID, now, cfg.CutoffPercentUsed) {
 			blockedCandidates++
+			r.queueCandidateRefresh(candidate.ID, cfg, now)
 			continue
 		}
 		if selected == nil || candidate.Priority > selected.Priority ||

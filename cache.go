@@ -82,19 +82,25 @@ func (c *quotaCache) reconcile(auths []physicalClaudeAuth) {
 	c.mu.Unlock()
 }
 
-func (c *quotaCache) claimRefresh(authID string, now time.Time, cutoff float64, minimumAge time.Duration) bool {
+func (c *quotaCache) claimRefresh(authID string, now time.Time, cutoff float64, minimumAge, blockedRefreshInterval time.Duration) bool {
 	if strings.TrimSpace(authID) == "" {
 		return false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	sample := c.samples[authID]
-	if sample.blocked(now, cutoff) {
-		return false
-	}
 	lastCheck := sample.SampledAt
 	if sample.LastAttemptAt.After(lastCheck) {
 		lastCheck = sample.LastAttemptAt
+	}
+	if sample.blocked(now, cutoff) {
+		if blockedRefreshInterval <= 0 {
+			return false
+		}
+		minimumAge = blockedRefreshInterval
+	} else if sample.HasSample && !sample.ResetAt.IsZero() && !now.Before(sample.ResetAt) && lastCheck.Before(sample.ResetAt) {
+		// A passed reset invalidates pre-reset timing, but not post-reset retries.
+		lastCheck = time.Time{}
 	}
 	if !lastCheck.IsZero() && now.Before(lastCheck.Add(minimumAge)) {
 		return false

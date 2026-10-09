@@ -19,19 +19,21 @@ type lifecycleRequest struct {
 }
 
 type rawPluginConfig struct {
-	Enabled           *bool     `yaml:"enabled"`
-	ProtectedModels   *[]string `yaml:"protected-models"`
-	CutoffPercentUsed *float64  `yaml:"cutoff-percent-used"`
-	PollInterval      string    `yaml:"poll-interval"`
-	RequestTimeout    string    `yaml:"request-timeout"`
+	Enabled                *bool     `yaml:"enabled"`
+	ProtectedModels        *[]string `yaml:"protected-models"`
+	CutoffPercentUsed      *float64  `yaml:"cutoff-percent-used"`
+	PollInterval           string    `yaml:"poll-interval"`
+	BlockedRefreshInterval string    `yaml:"blocked-refresh-interval"`
+	RequestTimeout         string    `yaml:"request-timeout"`
 }
 
 type pluginConfig struct {
-	Enabled           bool
-	ProtectedModels   []string
-	CutoffPercentUsed float64
-	PollInterval      time.Duration
-	RequestTimeout    time.Duration
+	Enabled                bool
+	ProtectedModels        []string
+	CutoffPercentUsed      float64
+	PollInterval           time.Duration
+	BlockedRefreshInterval time.Duration
+	RequestTimeout         time.Duration
 }
 
 type registration struct {
@@ -56,11 +58,12 @@ type managementRoute struct {
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
-		Enabled:           true,
-		ProtectedModels:   []string{defaultProtectedModel},
-		CutoffPercentUsed: defaultCutoffPercentUsed,
-		PollInterval:      defaultPollInterval,
-		RequestTimeout:    defaultRequestTimeout,
+		Enabled:                true,
+		ProtectedModels:        []string{defaultProtectedModel},
+		CutoffPercentUsed:      defaultCutoffPercentUsed,
+		PollInterval:           defaultPollInterval,
+		BlockedRefreshInterval: defaultBlockedRefreshInterval,
+		RequestTimeout:         defaultRequestTimeout,
 	}
 }
 
@@ -99,6 +102,13 @@ func decodeLifecycleConfig(raw []byte) (pluginConfig, error) {
 		}
 		cfg.PollInterval = interval
 	}
+	if value := strings.TrimSpace(decoded.BlockedRefreshInterval); value != "" {
+		interval, err := time.ParseDuration(value)
+		if err != nil {
+			return pluginConfig{}, fmt.Errorf("blocked-refresh-interval must be a Go duration")
+		}
+		cfg.BlockedRefreshInterval = interval
+	}
 	if value := strings.TrimSpace(decoded.RequestTimeout); value != "" {
 		timeout, err := time.ParseDuration(value)
 		if err != nil {
@@ -111,6 +121,9 @@ func decodeLifecycleConfig(raw []byte) (pluginConfig, error) {
 	}
 	if cfg.PollInterval <= 0 {
 		return pluginConfig{}, fmt.Errorf("poll-interval must be greater than zero")
+	}
+	if cfg.BlockedRefreshInterval < 0 {
+		return pluginConfig{}, fmt.Errorf("blocked-refresh-interval must not be negative")
 	}
 	if cfg.RequestTimeout <= 0 {
 		return pluginConfig{}, fmt.Errorf("request-timeout must be greater than zero")
@@ -169,6 +182,11 @@ func pluginRegistration() registration {
 					Name:        "poll-interval",
 					Type:        pluginapi.ConfigFieldTypeString,
 					Description: "Minimum cached-usage age before a protected-model request queues another refresh. Default: 5m.",
+				},
+				{
+					Name:        "blocked-refresh-interval",
+					Type:        pluginapi.ConfigFieldTypeString,
+					Description: "Minimum age since the latest sample or attempt before a protected-model request queues a blocked auth refresh, as a Go duration. Default: 6h; 0 disables.",
 				},
 				{
 					Name:        "request-timeout",
