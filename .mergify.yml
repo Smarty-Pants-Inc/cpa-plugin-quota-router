@@ -1,0 +1,52 @@
+merge_queue:
+  mode: serial
+  max_parallel_checks: 1
+  reset_on_external_merge: always
+
+# The fleet's plain rule (smarty-dev#865), as on CLIProxyAPI, pi and herdr: the PR, its required checks
+# and this queue are the review. `hold` and DO NOT LAND titles keep a PR out.
+queue_rules:
+  - name: default
+    checks_timeout: 90 min
+    merge_method: merge
+    queue_conditions:
+      - base = main
+      - -draft
+      - -label = hold
+      - -title ~= (?i)do not land
+      - check-success = review/astra
+      # A PR that needs a named security pass waits for review/security on the exact head.
+      - or:
+          - -label = needs-security-pass
+          - check-success = review/security
+      - check-success = test
+    merge_conditions:
+      - check-success = test
+
+# The fleet's write App bots may queue (smarty-dev#735, #736, #1513): GitHub reports App bots as
+# permission none, so the default `sender-permission >= write` restriction refused their queue commands.
+commands_restrictions:
+  queue:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
+  dequeue:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
+  refresh:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
