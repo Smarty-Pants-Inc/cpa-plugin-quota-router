@@ -595,17 +595,17 @@ func TestSuccessfulBelowCutoffRefreshClearsBlockedState(t *testing.T) {
 	}
 }
 
-func TestExpiredResetClearsStaleBlockedSample(t *testing.T) {
+func TestResetPendingExpiredResetDoesNotClearBlockedSample(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
 	runtime.cache.recordSuccess("auth-a", 80, now.Add(-time.Second), now.Add(-time.Hour))
 	response, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0)))
-	if decisionError != nil || response.AuthID != "auth-a" {
-		t.Fatalf("response = %#v, error = %#v", response, decisionError)
+	if response.Handled || decisionError == nil || decisionError.Code != exhaustedErrorCode {
+		t.Fatalf("response = %#v, error = %#v; want exhausted without a fresh read", response, decisionError)
 	}
 	sample := runtime.cache.snapshot("auth-a")
-	if sample.known(now) || sample.blocked(now, 50) {
-		t.Fatalf("expired sample = %#v, want fail-open state", sample)
+	if sample.known(now) || !sample.blocked(now, 50) {
+		t.Fatalf("expired sample = %#v, want unknown but blocked reset-pending state", sample)
 	}
 }
 
@@ -1060,7 +1060,7 @@ func TestManagementStatusRouteExposesOnlySchedulerState(t *testing.T) {
 	}
 }
 
-func TestManagementStatusExpiresStaleBlockedSample(t *testing.T) {
+func TestResetPendingManagementStatusRetainsBlock(t *testing.T) {
 	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
 	runtime := newTestRuntime(&fakeHost{}, (&fakeFetcher{}).fetch, now)
 	runtime.cache.reconcile([]physicalClaudeAuth{{ID: "auth-a", AuthIndex: "index-a", Name: "claude-a.json"}})
@@ -1072,11 +1072,11 @@ func TestManagementStatusExpiresStaleBlockedSample(t *testing.T) {
 	if err := json.Unmarshal(response.Body, &status); err != nil {
 		t.Fatal(err)
 	}
-	if len(status.Accounts) != 1 || status.Accounts[0].Known || status.Accounts[0].Blocked || status.Accounts[0].WeeklyPercentUsed != nil || status.Accounts[0].LastErrorCategory != pollErrorRateLimited {
+	if len(status.Accounts) != 1 || status.Accounts[0].Known || !status.Accounts[0].Blocked || status.Accounts[0].WeeklyPercentUsed != nil || status.Accounts[0].LastErrorCategory != pollErrorRateLimited {
 		t.Fatalf("expired status = %#v", status)
 	}
-	if sample := runtime.cache.snapshot("auth-a"); sample.known(now) || sample.blocked(now, 50) {
-		t.Fatalf("expired cache sample = %#v", sample)
+	if sample := runtime.cache.snapshot("auth-a"); sample.known(now) || !sample.blocked(now, 50) {
+		t.Fatalf("reset-pending cache sample = %#v", sample)
 	}
 }
 
