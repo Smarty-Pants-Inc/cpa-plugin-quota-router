@@ -60,7 +60,8 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 	}
 	now := r.now()
 	var selected *pluginapi.SchedulerAuthCandidate
-	claudeCandidates, blockedCandidates := 0, 0
+	var resetPending []*pluginapi.SchedulerAuthCandidate
+	claudeCandidates := 0
 	for i := range req.Candidates {
 		candidate := &req.Candidates[i]
 		provider := strings.ToLower(strings.TrimSpace(candidate.Provider))
@@ -71,24 +72,83 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 			continue
 		}
 		claudeCandidates++
-		if r.cache.isBlocked(candidate.ID, now, cfg.CutoffPercentUsed) {
-			blockedCandidates++
+		sample := r.cache.snapshot(candidate.ID)
+		if sample.resetPending(now, cfg.CutoffPercentUsed) {
+			resetPending = append(resetPending, candidate)
+			continue
+		}
+		if sample.blocked(now, cfg.CutoffPercentUsed) {
 			r.queueCandidateRefresh(candidate.ID, cfg, now)
 			continue
 		}
-		if selected == nil || candidate.Priority > selected.Priority ||
-			(candidate.Priority == selected.Priority && candidate.ID < selected.ID) {
-			selected = candidate
-		}
+		selected = preferredCandidate(selected, candidate)
 	}
 	if selected != nil {
+		// A verified/otherwise normally eligible seat wins over reset-pending
+		// seats regardless of priority; their retries remain asynchronous.
+		for _, candidate := range resetPending {
+			r.queueCandidateRefresh(candidate.ID, cfg, now)
+		}
 		r.queueCandidateRefresh(selected.ID, cfg, now)
 		return pluginapi.SchedulerPickResponse{AuthID: selected.ID, Handled: true}, nil
 	}
-	if claudeCandidates > 0 && blockedCandidates == claudeCandidates {
+	if len(resetPending) > 0 {
+		ids := make([]string, 0, len(resetPending))
+		for _, candidate := range resetPending {
+			ids = append(ids, candidate.ID)
+		}
+		r.waitResetPending(ids, cfg, now)
+		now = r.now()
+		for _, candidate := range resetPending {
+			sample := r.cache.snapshot(candidate.ID)
+			if sample.HasSample && sample.WeeklyPercentUsed < cfg.CutoffPercentUsed {
+				selected = preferredCandidate(selected, candidate)
+			}
+		}
+		if selected != nil {
+			return pluginapi.SchedulerPickResponse{AuthID: selected.ID, Handled: true}, nil
+		}
+
+		// Owner's stated quota-host OUTAGE exception: only when EVERY candidate
+		// is reset-pending and fresh reads failed with host/fetch errors, treat
+		// them as unknown for this pick (the existing unknown policy is eligible).
+		// This gateway is the fleet's only model path; upstream 429s are cooled
+		// by the gateway. Never apply this to a successful exhausted reading or
+		// unfinished work, and never erase the cached block on a failed read.
+		if len(resetPending) == claudeCandidates {
+			failures := make(map[string]string, len(ids))
+			for _, candidate := range resetPending {
+				category := r.resetPendingFailure(candidate.ID, now, cfg.CutoffPercentUsed)
+				if category == "" {
+					break
+				}
+				failures[candidate.ID] = category
+			}
+			if len(failures) == len(ids) {
+				for _, candidate := range resetPending {
+					selected = preferredCandidate(selected, candidate)
+				}
+				sort.Strings(ids)
+				r.log("warn", "quota host unavailable; routing on unverified post-reset seats", map[string]any{
+					"seats": ids,
+					"error": failures,
+				})
+				return pluginapi.SchedulerPickResponse{AuthID: selected.ID, Handled: true}, nil
+			}
+		}
+	}
+	if claudeCandidates > 0 {
 		return pluginapi.SchedulerPickResponse{}, &envelopeError{Code: exhaustedErrorCode, Message: exhaustedErrorCode}
 	}
 	return pluginapi.SchedulerPickResponse{Handled: false}, nil
+}
+
+func preferredCandidate(selected, candidate *pluginapi.SchedulerAuthCandidate) *pluginapi.SchedulerAuthCandidate {
+	if selected == nil || candidate.Priority > selected.Priority ||
+		(candidate.Priority == selected.Priority && candidate.ID < selected.ID) {
+		return candidate
+	}
+	return selected
 }
 
 func isClaudeRequest(req pluginapi.SchedulerPickRequest) bool {

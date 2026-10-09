@@ -14,6 +14,7 @@ const (
 	exhaustedErrorCode       = "quota_router_exhausted"
 	managementStatusRoute    = "/plugins/quota-router/status"
 	managementStatusFullPath = "/v0/management" + managementStatusRoute
+	pollErrorAuthList        = "auth_list"
 	pollErrorAuthGet         = "auth_get"
 	pollErrorMissingToken    = "missing_token"
 	pollErrorInvalidWeekly   = "invalid_weekly"

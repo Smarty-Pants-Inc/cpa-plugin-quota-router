@@ -42,8 +42,16 @@ func (s quotaSample) known(now time.Time) bool {
 	return s.HasSample && (s.ResetAt.IsZero() || now.Before(s.ResetAt))
 }
 
-func (s quotaSample) blocked(now time.Time, cutoff float64) bool {
-	return s.known(now) && s.WeeklyPercentUsed >= cutoff
+// Owner policy: a pre-reset EXHAUSTED sample becomes reset-pending at the
+// reset, not eligible. Only a successful fresh read below the cutoff clears it.
+// A fresh exhausted read stays blocked even if the host reports a past reset.
+func (s quotaSample) resetPending(now time.Time, cutoff float64) bool {
+	return s.HasSample && s.WeeklyPercentUsed >= cutoff && !s.ResetAt.IsZero() &&
+		!now.Before(s.ResetAt) && s.SampledAt.Before(s.ResetAt)
+}
+
+func (s quotaSample) blocked(_ time.Time, cutoff float64) bool {
+	return s.HasSample && s.WeeklyPercentUsed >= cutoff
 }
 
 type quotaCache struct {
@@ -93,19 +101,25 @@ func (c *quotaCache) claimRefresh(authID string, now time.Time, cutoff float64, 
 	if sample.LastAttemptAt.After(lastCheck) {
 		lastCheck = sample.LastAttemptAt
 	}
-	if sample.blocked(now, cutoff) {
+	if sample.resetPending(now, cutoff) {
+		// First use at reset bypasses pre-reset timing. Failed post-reset
+		// attempts still use the normal retry age, avoiding a request storm.
+		if lastCheck.Before(sample.ResetAt) {
+			lastCheck = time.Time{}
+		}
+	} else if sample.blocked(now, cutoff) {
 		if blockedRefreshInterval <= 0 {
 			return false
 		}
 		minimumAge = blockedRefreshInterval
 	} else if sample.HasSample && !sample.ResetAt.IsZero() && !now.Before(sample.ResetAt) && lastCheck.Before(sample.ResetAt) {
-		// A passed reset invalidates pre-reset timing, but not post-reset retries.
 		lastCheck = time.Time{}
 	}
 	if !lastCheck.IsZero() && now.Before(lastCheck.Add(minimumAge)) {
 		return false
 	}
 	sample.LastAttemptAt = now
+	sample.LastErrorCategory = ""
 	c.samples[authID] = sample
 	return true
 }
@@ -117,6 +131,7 @@ func (c *quotaCache) recordAttempt(authID string, attemptedAt time.Time) {
 	c.mu.Lock()
 	sample := c.samples[authID]
 	sample.LastAttemptAt = attemptedAt
+	sample.LastErrorCategory = ""
 	c.samples[authID] = sample
 	c.mu.Unlock()
 }

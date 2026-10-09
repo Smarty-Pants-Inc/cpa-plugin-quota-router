@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,9 @@ type pluginRuntime struct {
 	pendingIDs  map[string]struct{}
 	inFlightAll bool
 	inFlightIDs map[string]struct{}
+	// Closed/replaced on worker completion so synchronous picks can join the
+	// existing per-seat coalesced work without polling or duplicate fetches.
+	refreshChanged chan struct{}
 }
 
 func newPluginRuntime(host hostClient, fetch usageFetcher, now func() time.Time) *pluginRuntime {
@@ -44,10 +48,11 @@ func newPluginRuntime(host hostClient, fetch usageFetcher, now func() time.Time)
 		now = time.Now
 	}
 	runtime := &pluginRuntime{
-		cache: quotaCache{samples: make(map[string]quotaSample)},
-		host:  host,
-		fetch: fetch,
-		now:   now,
+		cache:          quotaCache{samples: make(map[string]quotaSample)},
+		host:           host,
+		fetch:          fetch,
+		now:            now,
+		refreshChanged: make(chan struct{}),
 	}
 	cfg := defaultPluginConfig()
 	runtime.config.Store(&cfg)
@@ -113,6 +118,7 @@ func (r *pluginRuntime) stopLocked() {
 	r.pendingAll, r.inFlightAll = false, false
 	clear(r.pendingIDs)
 	clear(r.inFlightIDs)
+	r.notifyRefreshLocked()
 	r.refreshMu.Unlock()
 	r.log("info", "quota router refresh worker stopped", nil)
 }
@@ -181,6 +187,71 @@ func (r *pluginRuntime) queueCandidateRefresh(authID string, cfg pluginConfig, n
 	}
 }
 
+// Owner policy: when no normally eligible seat exists, selection waits for a
+// bounded fresh read of reset-pending seats through the same worker/fetch path.
+// Queueing still obeys post-failure retry age; an existing pending/in-flight
+// refresh is joined, never duplicated. A wait timeout alone is NOT an outage.
+func (r *pluginRuntime) waitResetPending(authIDs []string, cfg pluginConfig, now time.Time) {
+	ctx, cancel := context.WithTimeout(context.Background(), resetReadTimeout(cfg))
+	defer cancel()
+	for _, authID := range authIDs {
+		r.queueCandidateRefresh(authID, cfg, now)
+	}
+	for {
+		r.refreshMu.Lock()
+		changed := r.refreshChanged
+		active := r.pendingAll || r.inFlightAll
+		for _, authID := range authIDs {
+			_, pending := r.pendingIDs[authID]
+			_, inFlight := r.inFlightIDs[authID]
+			active = active || pending || inFlight
+		}
+		r.refreshMu.Unlock()
+		if !active {
+			return
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func resetReadTimeout(cfg pluginConfig) time.Duration {
+	return min(cfg.RequestTimeout, 2*time.Second)
+}
+
+// A completed post-reset host/fetch failure can support the stated outage
+// exception. Pending work, cancellation, and unusable local credentials cannot.
+func (r *pluginRuntime) resetPendingFailure(authID string, now time.Time, cutoff float64) string {
+	r.refreshMu.Lock()
+	defer r.refreshMu.Unlock()
+	_, pending := r.pendingIDs[authID]
+	_, inFlight := r.inFlightIDs[authID]
+	if r.pendingAll || r.inFlightAll || pending || inFlight {
+		return ""
+	}
+	sample := r.cache.snapshot(authID)
+	if !sample.resetPending(now, cutoff) || sample.LastAttemptAt.Before(sample.ResetAt) {
+		return ""
+	}
+	switch sample.LastErrorCategory {
+	case pollErrorAuthList, pollErrorAuthGet, pollErrorTimeout, pollErrorNetwork,
+		pollErrorUnauthorized, pollErrorForbidden, pollErrorRateLimited,
+		pollErrorServer, pollErrorHTTP, pollErrorRead, pollErrorInvalidJSON,
+		pollErrorInvalidWeekly, pollErrorBodyTooLarge:
+		return sample.LastErrorCategory
+	default:
+		return ""
+	}
+}
+
+func (r *pluginRuntime) notifyRefreshLocked() {
+	close(r.refreshChanged)
+	r.refreshChanged = make(chan struct{})
+}
+
 func (r *pluginRuntime) refreshLoop(ctx context.Context, wake <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	for {
@@ -232,6 +303,7 @@ func (r *pluginRuntime) takePendingRefresh() (bool, map[string]struct{}) {
 func (r *pluginRuntime) finishRefresh(all bool, authIDs map[string]struct{}) {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
+	defer r.notifyRefreshLocked()
 	if all {
 		r.inFlightAll = false
 		return
@@ -251,7 +323,17 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 	}
 	entries, err := r.host.listAuth()
 	if err != nil {
-		r.log("warn", "quota router auth discovery failed", map[string]any{"category": "auth_list"})
+		if all {
+			authIDs = make(map[string]struct{})
+			for _, account := range r.cache.statuses(r.now(), cfg.CutoffPercentUsed) {
+				authIDs[account.ID] = struct{}{}
+			}
+		}
+		for authID := range authIDs {
+			r.cache.recordAttempt(authID, r.now())
+			r.cache.recordFailure(authID, pollErrorAuthList)
+		}
+		r.log("warn", "quota router auth discovery failed", map[string]any{"category": pollErrorAuthList})
 		return
 	}
 	auths := physicalClaudeAuths(entries)
@@ -270,6 +352,14 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 }
 
 func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig) {
+	if r.cache.snapshot(auth.ID).resetPending(r.now(), cfg.CutoffPercentUsed) {
+		// Bound the fresh fetch too; pick's separate deadline also bounds a
+		// blocked host callback (the host API itself has no context argument).
+		cfg.RequestTimeout = resetReadTimeout(cfg)
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cfg.RequestTimeout)
+		defer cancel()
+	}
 	r.cache.recordAttempt(auth.ID, r.now())
 	rawAuth, err := r.host.getAuth(auth.AuthIndex)
 	if err != nil {
@@ -288,6 +378,9 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 	}
 	result, category := r.fetch(ctx, token, cfg.RequestTimeout)
 	if category != "" {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			category = pollErrorTimeout
+		}
 		if category != pollErrorCancelled || ctx.Err() == nil {
 			r.recordPollFailure(auth.ID, category)
 		}

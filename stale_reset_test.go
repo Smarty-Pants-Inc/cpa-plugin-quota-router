@@ -153,17 +153,21 @@ func TestStaleResetFirstUseRereadsBeforePollInterval(t *testing.T) {
 			f.assertNoRefresh(t, 1, 1)
 
 			// The sample is only one minute old, but its reset has arrived.
-			// The base selects successfully and incorrectly suppresses this reread.
+			// Selection must wait for a successful below-cutoff reread.
 			f.clock.set(f.start.Add(time.Minute + afterReset))
 			statusResponse := f.runtime.handleManagement(pluginapi.ManagementRequest{Method: "GET", Path: managementStatusFullPath})
 			var status cutoffStatusResponse
 			if err := json.Unmarshal(statusResponse.Body, &status); err != nil {
 				t.Fatal(err)
 			}
-			if statusResponse.StatusCode != 200 || len(status.Accounts) != 1 || status.Accounts[0].Known || status.Accounts[0].Blocked || status.Accounts[0].WeeklyPercentUsed != nil {
-				t.Fatalf("reset must expose unknown status without a percent: response=%#v status=%#v", statusResponse, status)
+			if statusResponse.StatusCode != 200 || len(status.Accounts) != 1 || status.Accounts[0].Known || !status.Accounts[0].Blocked || status.Accounts[0].WeeklyPercentUsed != nil {
+				t.Fatalf("reset-pending must expose unknown but blocked status without a percent: response=%#v status=%#v", statusResponse, status)
 			}
 			f.pickEligible(t)
+			if sample := f.runtime.cache.snapshot("auth-a"); sample.WeeklyPercentUsed != 5 || !sample.SampledAt.Equal(f.clock.now()) {
+				t.Fatalf("first-use pick returned before the fresh low read: %#v", sample)
+			}
+			f.assertCounts(t, 2, 2)
 			f.waitLow(t, 2, 2)
 			f.pickEligible(t)
 			f.assertNoRefresh(t, 2, 2)
@@ -171,30 +175,43 @@ func TestStaleResetFirstUseRereadsBeforePollInterval(t *testing.T) {
 	}
 }
 
-func TestStaleResetFailedPostResetRereadThrottlesFromAttempt(t *testing.T) {
+func TestStaleResetFailedPostResetRereadSelectsVerifiedSeatAndThrottlesFromAttempt(t *testing.T) {
 	f := newStaleResetFixture(t, "poll-interval: 5m\nblocked-refresh-interval: 0s\n", time.Minute, false,
 		fetchReply{category: pollErrorNetwork},
 		fetchReply{result: usageResult{WeeklyPercentUsed: 5, ResetAt: time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)}},
 	)
 	firstAttempt := f.start.Add(time.Minute)
 	f.clock.set(firstAttempt)
-	f.pickEligible(t)
+	f.host.mu.Lock()
+	f.host.entries = append(f.host.entries, physicalEntry("auth-b", "index-b"))
+	f.host.authJSON["index-b"] = credentialJSON("token-b")
+	f.host.mu.Unlock()
+	pickVerified := func() {
+		t.Helper()
+		f.runtime.cache.recordSuccess("auth-b", 10, f.start.Add(7*24*time.Hour), f.clock.now())
+		response, decisionError := f.runtime.pick(claudeRequest(candidate("auth-a", 100), candidate("auth-b", 1)))
+		if decisionError != nil || !response.Handled || response.AuthID != "auth-b" {
+			t.Fatalf("reset-pending/failed high-priority seat must not displace verified auth-b: response=%#v error=%#v", response, decisionError)
+		}
+	}
+	pickVerified()
 	waitFor(t, func() bool {
 		return f.runtime.cache.snapshot("auth-a").LastErrorCategory == pollErrorNetwork && f.idle()
 	})
 	f.assertCounts(t, 2, 2)
-	if sample := f.runtime.cache.snapshot("auth-a"); sample.known(f.clock.now()) || sample.blocked(f.clock.now(), f.cfg.CutoffPercentUsed) || !sample.LastAttemptAt.Equal(firstAttempt) {
-		t.Fatalf("failed post-reset reread must remain unknown/eligible and record its attempt: %#v", sample)
+	if sample := f.runtime.cache.snapshot("auth-a"); sample.known(f.clock.now()) || !sample.blocked(f.clock.now(), f.cfg.CutoffPercentUsed) || !sample.LastAttemptAt.Equal(firstAttempt) {
+		t.Fatalf("failed post-reset reread must remain unknown but ineligible and record its attempt: %#v", sample)
 	}
+	assertResetOutageWarnings(t, f.host, 0, nil)
 	// Repeated picks at reset, at the old sample's poll boundary, and just
 	// before the new attempt's boundary must not start a retry storm.
 	for _, age := range []time.Duration{time.Minute, 5 * time.Minute, 6*time.Minute - time.Nanosecond} {
 		f.clock.set(f.start.Add(age))
-		f.pickEligible(t)
+		pickVerified()
 		f.assertNoRefresh(t, 2, 2)
 	}
 	f.clock.set(firstAttempt.Add(5 * time.Minute))
-	f.pickEligible(t)
+	pickVerified()
 	f.waitLow(t, 3, 3)
 }
 
