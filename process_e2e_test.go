@@ -44,7 +44,7 @@ func TestCLIProxyAPIProcessEndToEnd(t *testing.T) {
 			http.Error(w, "unknown token", http.StatusUnauthorized)
 			return
 		}
-		_, _ = fmt.Fprintf(w, `{"seven_day":{"utilization":%d,"resets_at":"2099-01-01T00:00:00Z"}}`, utilization)
+		_, _ = fmt.Fprintf(w, `{"five_hour":{"utilization":%d,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":%d,"resets_at":"2099-01-01T00:00:00Z"}}`, utilization, utilization)
 	}))
 	defer usageServer.Close()
 
@@ -123,8 +123,9 @@ plugins:
     quota-router:
       enabled: true
       priority: 100
-      protected-models: [claude-fable-5]
+      protected-models: ["claude-fable-*"]
       cutoff-percent-used: 50
+      five-hour-cutoff-percent-used: 50
       poll-interval: 50ms
       request-timeout: 1s
 `, port, proxyServer.URL, authDir, e2eAPIKey, e2eManagementKey, pluginDir)
@@ -168,7 +169,7 @@ plugins:
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	client := &http.Client{Timeout: 2 * time.Second}
 	status := waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status cutoffStatusResponse) bool {
-		if !status.Enabled || len(status.ProtectedModels) != 1 || status.ProtectedModels[0] != defaultProtectedModel || status.CutoffPercentUsed != 50 || len(status.Accounts) != 2 {
+		if !status.Enabled || len(status.ProtectedModels) != 1 || status.ProtectedModels[0] != "claude-fable-*" || status.CutoffPercentUsed != 50 || status.FiveHourCutoffPercentUsed != 50 || len(status.Accounts) != 2 {
 			return false
 		}
 		for _, account := range status.Accounts {
@@ -226,18 +227,18 @@ drainProxyHits:
 
 	blockedResponse := postClaudeMessage(t, client, baseURL, defaultProtectedModel)
 	if !bytes.Contains(blockedResponse, []byte(exhaustedErrorCode)) {
-		t.Fatalf("protected request did not return cutoff error: %s\nserver log:\n%s", blockedResponse, readLog(logPath))
+		t.Fatalf("wildcard-protected request did not return cutoff error: %s\nserver log:\n%s", blockedResponse, readLog(logPath))
 	}
 	select {
 	case hit := <-proxyHits:
-		t.Fatalf("protected request reached upstream proxy: %s", hit)
+		t.Fatalf("wildcard-protected request reached upstream proxy: %s", hit)
 	default:
 	}
 	if hits := e2eUsageHits.Load(); hits != startupUsageHits {
 		t.Fatalf("blocked request refreshed usage before reset: hits=%d, want %d", hits, startupUsageHits)
 	}
 
-	patch := []byte(`{"cutoff-percent-used":90}`)
+	patch := []byte(`{"cutoff-percent-used":90,"five-hour-cutoff-percent-used":90}`)
 	request, err := http.NewRequest(http.MethodPatch, baseURL+"/v0/management/plugins/"+pluginName+"/config", bytes.NewReader(patch))
 	if err != nil {
 		t.Fatal(err)
@@ -254,7 +255,7 @@ drainProxyHits:
 	}
 
 	waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status cutoffStatusResponse) bool {
-		if status.CutoffPercentUsed != 90 || len(status.Accounts) != 2 {
+		if status.CutoffPercentUsed != 90 || status.FiveHourCutoffPercentUsed != 90 || len(status.Accounts) != 2 {
 			return false
 		}
 		for _, account := range status.Accounts {

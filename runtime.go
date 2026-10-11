@@ -171,7 +171,7 @@ func (r *pluginRuntime) queueCandidateRefresh(authID string, cfg pluginConfig, n
 		r.refreshMu.Unlock()
 		return
 	}
-	if !r.cache.claimRefreshWindows(authID, now, cfg.CutoffPercentUsed, cfg.FiveHourCutoffPercentUsed, cfg.PollInterval, cfg.BlockedRefreshInterval) {
+	if !r.cache.claimRefreshWindows(authID, now, cfg.CutoffPercentUsed, cfg.effectiveFiveHourCutoff(), cfg.PollInterval, cfg.BlockedRefreshInterval) {
 		r.refreshMu.Unlock()
 		return
 	}
@@ -330,7 +330,7 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 	if err != nil {
 		if all {
 			authIDs = make(map[string]struct{})
-			for _, account := range r.cache.statusesWindows(r.now(), cfg.CutoffPercentUsed, cfg.FiveHourCutoffPercentUsed) {
+			for _, account := range r.cache.statusesWindows(r.now(), cfg.CutoffPercentUsed, cfg.effectiveFiveHourCutoff()) {
 				authIDs[account.ID] = struct{}{}
 			}
 		}
@@ -357,7 +357,7 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 }
 
 func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig) {
-	if r.cache.snapshot(auth.ID).resetPendingWindows(r.now(), cfg.CutoffPercentUsed, cfg.FiveHourCutoffPercentUsed) {
+	if r.cache.snapshot(auth.ID).resetPendingWindows(r.now(), cfg.CutoffPercentUsed, cfg.effectiveFiveHourCutoff()) {
 		// Bound the fresh fetch too; pick's separate deadline also bounds a
 		// blocked host callback (the host API itself has no context argument).
 		cfg.RequestTimeout = resetReadTimeout(cfg)
@@ -397,7 +397,7 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 	r.log("debug", "quota router quota refreshed", map[string]any{
 		"auth_id":             auth.ID,
 		"weekly_percent_used": result.WeeklyPercentUsed,
-		"blocked":             r.cache.isBlockedWindows(auth.ID, r.now(), cfg.CutoffPercentUsed, cfg.FiveHourCutoffPercentUsed),
+		"blocked":             r.cache.isBlockedWindows(auth.ID, r.now(), cfg.CutoffPercentUsed, cfg.effectiveFiveHourCutoff()),
 	})
 }
 

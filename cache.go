@@ -16,15 +16,17 @@ type cutoffStatusResponse struct {
 }
 
 type cutoffAccountStatus struct {
-	ID                string   `json:"id"`
-	AuthIndex         string   `json:"auth_index,omitempty"`
-	Name              string   `json:"name,omitempty"`
-	Known             bool     `json:"known"`
-	Blocked           bool     `json:"blocked"`
-	WeeklyPercentUsed *float64 `json:"weekly_percent_used,omitempty"`
-	SampledAt         string   `json:"sampled_at,omitempty"`
-	ResetAt           string   `json:"reset_at,omitempty"`
-	LastErrorCategory string   `json:"last_error_category,omitempty"`
+	ID                  string   `json:"id"`
+	AuthIndex           string   `json:"auth_index,omitempty"`
+	Name                string   `json:"name,omitempty"`
+	Known               bool     `json:"known"`
+	Blocked             bool     `json:"blocked"`
+	WeeklyPercentUsed   *float64 `json:"weekly_percent_used,omitempty"`
+	FiveHourPercentUsed *float64 `json:"five_hour_percent_used,omitempty"`
+	SampledAt           string   `json:"sampled_at,omitempty"`
+	ResetAt             string   `json:"reset_at,omitempty"`
+	FiveHourResetAt     string   `json:"five_hour_reset_at,omitempty"`
+	LastErrorCategory   string   `json:"last_error_category,omitempty"`
 }
 
 type quotaSample struct {
@@ -83,14 +85,21 @@ func (s quotaSample) blockedWindows(_ time.Time, cutoff, fiveHourCutoff float64)
 	if !s.HasSample {
 		return false
 	}
+	if s.SevenDayPercentUsed != nil && s.FiveHourPercentUsed == nil {
+		return true // fail closed if 5h metric is missing on a multi-window sample
+	}
+	sevenDay := s.WeeklyPercentUsed
 	if s.SevenDayPercentUsed != nil {
-		if *s.SevenDayPercentUsed >= cutoff {
-			return true
-		}
-	} else if s.WeeklyPercentUsed >= cutoff {
+		sevenDay = *s.SevenDayPercentUsed
+	}
+	fiveHour := sevenDay
+	if s.FiveHourPercentUsed != nil {
+		fiveHour = *s.FiveHourPercentUsed
+	}
+	if sevenDay >= cutoff {
 		return true
 	}
-	if s.FiveHourPercentUsed != nil && *s.FiveHourPercentUsed >= fiveHourCutoff {
+	if fiveHour >= fiveHourCutoff {
 		return true
 	}
 	return false
@@ -148,9 +157,25 @@ func (c *quotaCache) claimRefreshWindows(authID string, now time.Time, cutoff, f
 		lastCheck = sample.LastAttemptAt
 	}
 	if sample.resetPendingWindows(now, cutoff, fiveHourCutoff) {
-		// First use at reset bypasses pre-reset timing. Failed post-reset
-		// attempts still use the normal retry age, avoiding a request storm.
-		if lastCheck.Before(sample.ResetAt) {
+		// First use at reset bypasses pre-reset timing for the specific expired window.
+		// Failed post-reset attempts still use the normal retry age, avoiding a request storm.
+		bypassReset := false
+		if sample.FiveHourPercentUsed != nil && *sample.FiveHourPercentUsed >= fiveHourCutoff &&
+			!sample.FiveHourResetAt.IsZero() && !now.Before(sample.FiveHourResetAt) &&
+			lastCheck.Before(sample.FiveHourResetAt) {
+			bypassReset = true
+		}
+		if sample.SevenDayPercentUsed != nil && *sample.SevenDayPercentUsed >= cutoff &&
+			!sample.SevenDayResetAt.IsZero() && !now.Before(sample.SevenDayResetAt) &&
+			lastCheck.Before(sample.SevenDayResetAt) {
+			bypassReset = true
+		}
+		if sample.SevenDayPercentUsed == nil && sample.WeeklyPercentUsed >= cutoff &&
+			!sample.ResetAt.IsZero() && !now.Before(sample.ResetAt) &&
+			lastCheck.Before(sample.ResetAt) {
+			bypassReset = true
+		}
+		if bypassReset {
 			lastCheck = time.Time{}
 		}
 	} else if sample.blockedWindows(now, cutoff, fiveHourCutoff) {
@@ -158,8 +183,14 @@ func (c *quotaCache) claimRefreshWindows(authID string, now time.Time, cutoff, f
 			return false
 		}
 		minimumAge = blockedRefreshInterval
-	} else if sample.HasSample && !sample.ResetAt.IsZero() && !now.Before(sample.ResetAt) && lastCheck.Before(sample.ResetAt) {
-		lastCheck = time.Time{}
+	} else if sample.HasSample {
+		if !sample.FiveHourResetAt.IsZero() && !now.Before(sample.FiveHourResetAt) && lastCheck.Before(sample.FiveHourResetAt) {
+			lastCheck = time.Time{}
+		} else if !sample.SevenDayResetAt.IsZero() && !now.Before(sample.SevenDayResetAt) && lastCheck.Before(sample.SevenDayResetAt) {
+			lastCheck = time.Time{}
+		} else if !sample.ResetAt.IsZero() && !now.Before(sample.ResetAt) && lastCheck.Before(sample.ResetAt) {
+			lastCheck = time.Time{}
+		}
 	}
 	if !lastCheck.IsZero() && now.Before(lastCheck.Add(minimumAge)) {
 		return false
@@ -191,10 +222,22 @@ func (c *quotaCache) recordUsage(authID string, res usageResult, sampledAt time.
 	sample.HasSample = true
 	sample.WeeklyPercentUsed = res.WeeklyPercentUsed
 	sample.ResetAt = res.ResetAt
-	sample.FiveHourPercentUsed = res.FiveHourPercentUsed
-	sample.FiveHourResetAt = res.FiveHourResetAt
-	sample.SevenDayPercentUsed = res.SevenDayPercentUsed
-	sample.SevenDayResetAt = res.SevenDayResetAt
+	if res.SevenDayPercentUsed != nil {
+		sample.SevenDayPercentUsed = res.SevenDayPercentUsed
+		sample.SevenDayResetAt = res.SevenDayResetAt
+	} else {
+		val := res.WeeklyPercentUsed
+		sample.SevenDayPercentUsed = &val
+		sample.SevenDayResetAt = res.ResetAt
+	}
+	if res.FiveHourPercentUsed != nil {
+		sample.FiveHourPercentUsed = res.FiveHourPercentUsed
+		sample.FiveHourResetAt = res.FiveHourResetAt
+	} else {
+		val := res.WeeklyPercentUsed
+		sample.FiveHourPercentUsed = &val
+		sample.FiveHourResetAt = res.ResetAt
+	}
 	sample.SampledAt = sampledAt
 	sample.LastAttemptAt = sampledAt
 	sample.LastErrorCategory = ""
@@ -203,9 +246,14 @@ func (c *quotaCache) recordUsage(authID string, res usageResult, sampledAt time.
 }
 
 func (c *quotaCache) recordSuccess(authID string, percentUsed float64, resetAt, sampledAt time.Time) {
+	pct := percentUsed
 	c.recordUsage(authID, usageResult{
-		WeeklyPercentUsed: percentUsed,
-		ResetAt:           resetAt,
+		WeeklyPercentUsed:   percentUsed,
+		ResetAt:             resetAt,
+		SevenDayPercentUsed: &pct,
+		SevenDayResetAt:     resetAt,
+		FiveHourPercentUsed: &pct,
+		FiveHourResetAt:     resetAt,
 	}, sampledAt)
 }
 
@@ -258,12 +306,24 @@ func (c *quotaCache) statusesWindows(now time.Time, cutoff, fiveHourCutoff float
 			LastErrorCategory: sample.LastErrorCategory,
 		}
 		if known {
-			percentUsed := sample.WeeklyPercentUsed
-			account.WeeklyPercentUsed = &percentUsed
+			if sample.SevenDayPercentUsed != nil {
+				account.WeeklyPercentUsed = sample.SevenDayPercentUsed
+			} else if sample.HasSample {
+				percentUsed := sample.WeeklyPercentUsed
+				account.WeeklyPercentUsed = &percentUsed
+			}
+			account.FiveHourPercentUsed = sample.FiveHourPercentUsed
 			if !sample.SampledAt.IsZero() {
 				account.SampledAt = sample.SampledAt.UTC().Format(time.RFC3339Nano)
 			}
-			account.ResetAt = sample.ResetAt.UTC().Format(time.RFC3339Nano)
+			if !sample.SevenDayResetAt.IsZero() {
+				account.ResetAt = sample.SevenDayResetAt.UTC().Format(time.RFC3339Nano)
+			} else if !sample.ResetAt.IsZero() {
+				account.ResetAt = sample.ResetAt.UTC().Format(time.RFC3339Nano)
+			}
+			if !sample.FiveHourResetAt.IsZero() {
+				account.FiveHourResetAt = sample.FiveHourResetAt.UTC().Format(time.RFC3339Nano)
+			}
 		}
 		accounts = append(accounts, account)
 	}

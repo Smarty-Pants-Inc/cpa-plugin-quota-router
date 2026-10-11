@@ -310,7 +310,7 @@ func TestActualEndpointUtilizationScaleIsPercentPoints(t *testing.T) {
 			headerError <- "missing anthropic beta header"
 			return
 		}
-		_, _ = w.Write([]byte(`{"seven_day":{"utilization":9.0,"resets_at":"2026-07-25T00:00:00Z"}}`))
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":5.0,"resets_at":"2026-07-25T00:00:00Z"},"seven_day":{"utilization":9.0,"resets_at":"2026-07-25T00:00:00Z"}}`))
 	}))
 	defer server.Close()
 
@@ -326,6 +326,9 @@ func TestActualEndpointUtilizationScaleIsPercentPoints(t *testing.T) {
 	}
 	if result.WeeklyPercentUsed != 9.0 {
 		t.Fatalf("weekly percent = %v, want 9", result.WeeklyPercentUsed)
+	}
+	if result.FiveHourPercentUsed == nil || *result.FiveHourPercentUsed != 5.0 {
+		t.Fatalf("five hour percent = %v, want 5", result.FiveHourPercentUsed)
 	}
 	if result.ResetAt.Format(time.RFC3339) != "2026-07-25T00:00:00Z" {
 		t.Fatalf("reset = %s", result.ResetAt)
@@ -348,6 +351,7 @@ func TestMalformedOrMissingWeeklyQuotaFailsOpen(t *testing.T) {
 		{name: "numeric reset", body: `{"seven_day":{"utilization":50,"resets_at":1784937600}}`, category: pollErrorInvalidWeekly},
 		{name: "malformed json", body: `{"seven_day":`, category: pollErrorInvalidJSON},
 		{name: "missing seven_day with valid five_hour", body: `{"five_hour":{"utilization":10,"resets_at":"2026-07-25T00:00:00Z"},"seven_day":null}`, category: pollErrorInvalidWeekly},
+		{name: "missing five_hour with valid seven_day", body: `{"seven_day":{"utilization":10,"resets_at":"2026-07-25T00:00:00Z"}}`, category: pollErrorInvalidWeekly},
 		{name: "malformed five_hour with valid seven_day", body: `{"five_hour":{"utilization":-1},"seven_day":{"utilization":10,"resets_at":"2026-07-25T00:00:00Z"}}`, category: pollErrorInvalidWeekly},
 		{name: "valid both windows", body: `{"five_hour":{"utilization":10,"resets_at":"2026-07-25T00:00:00Z"},"seven_day":{"utilization":20,"resets_at":"2026-07-25T00:00:00Z"}}`, category: ""},
 	}
@@ -1043,7 +1047,8 @@ func TestManagementStatusRouteExposesOnlySchedulerState(t *testing.T) {
 	}
 	allowedKeys := map[string]bool{
 		"id": true, "auth_index": true, "name": true, "known": true, "blocked": true,
-		"weekly_percent_used": true, "sampled_at": true, "reset_at": true, "last_error_category": true,
+		"weekly_percent_used": true, "five_hour_percent_used": true, "five_hour_reset_at": true,
+		"sampled_at": true, "reset_at": true, "last_error_category": true,
 	}
 	for _, rawAccount := range rawAccounts {
 		account, okAccount := rawAccount.(map[string]any)
@@ -1221,7 +1226,7 @@ func TestCatduckDistinctCutoffsBlocking(t *testing.T) {
 	}
 }
 
-func TestCatduckDistinctCutoffsE2EScheduling(t *testing.T) {
+func TestCatduckDistinctCutoffsRuntimePickScheduling(t *testing.T) {
 	now := time.Date(2026, time.October, 11, 14, 0, 0, 0, time.UTC)
 	clock := &testClock{value: now}
 
@@ -1249,16 +1254,16 @@ func TestCatduckDistinctCutoffsE2EScheduling(t *testing.T) {
 	}
 	fetcher := &fakeFetcher{replies: map[string][]fetchReply{
 		"token-1": {{result: usageResult{
-			WeeklyPercentUsed:   95,
-			ResetAt:             fiveHourReset,
+			WeeklyPercentUsed:   18,
+			ResetAt:             sevenDayReset,
 			FiveHourPercentUsed: &fh95,
 			FiveHourResetAt:     fiveHourReset,
 			SevenDayPercentUsed: &sd18,
 			SevenDayResetAt:     sevenDayReset,
 		}}},
 		"token-2": {{result: usageResult{
-			WeeklyPercentUsed:   88,
-			ResetAt:             fiveHourReset,
+			WeeklyPercentUsed:   18,
+			ResetAt:             sevenDayReset,
 			FiveHourPercentUsed: &fh88,
 			FiveHourResetAt:     fiveHourReset,
 			SevenDayPercentUsed: &sd18,

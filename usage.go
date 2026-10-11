@@ -111,7 +111,7 @@ func (f httpUsageFetcher) fetch(ctx context.Context, token string, timeout time.
 	if json.Unmarshal(body, &payload) != nil {
 		return usageResult{}, pollErrorInvalidJSON
 	}
-	if payload.SevenDay == nil {
+	if payload.SevenDay == nil || payload.FiveHour == nil {
 		return usageResult{}, pollErrorInvalidWeekly
 	}
 	sdPct, ok := normalizeWeeklyPercent(payload.SevenDay.Utilization)
@@ -122,31 +122,23 @@ func (f httpUsageFetcher) fetch(ctx context.Context, token string, timeout time.
 	if !ok {
 		return usageResult{}, pollErrorInvalidWeekly
 	}
+	fhPct, ok := normalizeWeeklyPercent(payload.FiveHour.Utilization)
+	if !ok {
+		return usageResult{}, pollErrorInvalidWeekly
+	}
+	fhReset, ok := parseResetTime(payload.FiveHour.ResetsAt)
+	if !ok {
+		return usageResult{}, pollErrorInvalidWeekly
+	}
 
-	res := usageResult{
+	return usageResult{
 		WeeklyPercentUsed:   sdPct,
 		ResetAt:             sdReset,
 		SevenDayPercentUsed: &sdPct,
 		SevenDayResetAt:     sdReset,
-	}
-
-	if payload.FiveHour != nil {
-		fhPct, ok := normalizeWeeklyPercent(payload.FiveHour.Utilization)
-		if !ok {
-			return usageResult{}, pollErrorInvalidWeekly
-		}
-		fhReset, ok := parseResetTime(payload.FiveHour.ResetsAt)
-		if !ok {
-			return usageResult{}, pollErrorInvalidWeekly
-		}
-		res.FiveHourPercentUsed = &fhPct
-		res.FiveHourResetAt = fhReset
-		if fhPct > sdPct {
-			res.WeeklyPercentUsed = fhPct
-			res.ResetAt = fhReset
-		}
-	}
-	return res, ""
+		FiveHourPercentUsed: &fhPct,
+		FiveHourResetAt:     fhReset,
+	}, ""
 }
 
 // Anthropic reports percentage points: 1.0 means 1%, not 100%.

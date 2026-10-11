@@ -38,6 +38,13 @@ type pluginConfig struct {
 	RequestTimeout            time.Duration
 }
 
+func (c pluginConfig) effectiveFiveHourCutoff() float64 {
+	if c.FiveHourCutoffPercentUsed <= 0 {
+		return c.CutoffPercentUsed
+	}
+	return c.FiveHourCutoffPercentUsed
+}
+
 type registration struct {
 	SchemaVersion uint32                   `json:"schema_version"`
 	Metadata      pluginapi.Metadata       `json:"metadata"`
@@ -63,7 +70,7 @@ func defaultPluginConfig() pluginConfig {
 		Enabled:                   true,
 		ProtectedModels:           []string{defaultProtectedModel},
 		CutoffPercentUsed:         defaultCutoffPercentUsed,
-		FiveHourCutoffPercentUsed: defaultCutoffPercentUsed,
+		FiveHourCutoffPercentUsed: 0,
 		PollInterval:              defaultPollInterval,
 		BlockedRefreshInterval:    defaultBlockedRefreshInterval,
 		RequestTimeout:            defaultRequestTimeout,
