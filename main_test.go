@@ -347,6 +347,9 @@ func TestMalformedOrMissingWeeklyQuotaFailsOpen(t *testing.T) {
 		{name: "malformed reset", body: `{"seven_day":{"utilization":50,"resets_at":"not-a-time"}}`, category: pollErrorInvalidWeekly},
 		{name: "numeric reset", body: `{"seven_day":{"utilization":50,"resets_at":1784937600}}`, category: pollErrorInvalidWeekly},
 		{name: "malformed json", body: `{"seven_day":`, category: pollErrorInvalidJSON},
+		{name: "missing seven_day with valid five_hour", body: `{"five_hour":{"utilization":10,"resets_at":"2026-07-25T00:00:00Z"},"seven_day":null}`, category: pollErrorInvalidWeekly},
+		{name: "malformed five_hour with valid seven_day", body: `{"five_hour":{"utilization":-1},"seven_day":{"utilization":10,"resets_at":"2026-07-25T00:00:00Z"}}`, category: pollErrorInvalidWeekly},
+		{name: "valid both windows", body: `{"five_hour":{"utilization":10,"resets_at":"2026-07-25T00:00:00Z"},"seven_day":{"utilization":20,"resets_at":"2026-07-25T00:00:00Z"}}`, category: ""},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1136,8 +1139,221 @@ func TestConfigValidationAndRegistrationMetadata(t *testing.T) {
 	}
 	if fields["protected-models"] != pluginapi.ConfigFieldTypeArray ||
 		fields["cutoff-percent-used"] != pluginapi.ConfigFieldTypeNumber ||
+		fields["five-hour-cutoff-percent-used"] != pluginapi.ConfigFieldTypeNumber ||
 		fields["poll-interval"] != pluginapi.ConfigFieldTypeString ||
 		fields["request-timeout"] != pluginapi.ConfigFieldTypeString {
 		t.Fatalf("config fields = %#v", fields)
+	}
+}
+
+func TestCatduckGlobModelMatching(t *testing.T) {
+	tests := []struct {
+		model     string
+		protected []string
+		expected  bool
+	}{
+		{"claude-3-5-sonnet-20241022", []string{"*"}, true},
+		{"claude-opus-4", []string{"claude-*"}, true},
+		{"CLAUDE-OPUS-4", []string{"claude-*"}, true},
+		{"claude-sonnet-3-5", []string{"claude-opus-*"}, false},
+		{"gpt-4o", []string{"claude-*"}, false},
+		{"gpt-4o", []string{"*"}, true},
+		{"claude-3-7-sonnet", []string{"claude-3-7-sonnet"}, true},
+		{"", []string{"*"}, false},
+	}
+	for _, tc := range tests {
+		got := isProtectedModel(tc.model, tc.protected)
+		if got != tc.expected {
+			t.Fatalf("isProtectedModel(%q, %v) = %v; want %v", tc.model, tc.protected, got, tc.expected)
+		}
+	}
+}
+
+func TestCatduckDistinctCutoffsBlocking(t *testing.T) {
+	cache := &quotaCache{samples: make(map[string]quotaSample)}
+	now := time.Date(2026, time.October, 11, 12, 0, 0, 0, time.UTC)
+
+	sd18 := 18.0
+	fh88 := 88.0
+	cache.recordUsage("auth-1", usageResult{
+		WeeklyPercentUsed:   88,
+		ResetAt:             now.Add(3 * time.Hour),
+		FiveHourPercentUsed: &fh88,
+		FiveHourResetAt:     now.Add(3 * time.Hour),
+		SevenDayPercentUsed: &sd18,
+		SevenDayResetAt:     now.Add(48 * time.Hour),
+	}, now)
+
+	// auth-1: 5h=88% (cutoff 94%), 7d=18% (cutoff 88%) -> NOT blocked
+	if cache.isBlockedWindows("auth-1", now, 88, 94) {
+		t.Fatal("auth-1 should not be blocked under 88% 7d / 94% 5h cutoffs")
+	}
+
+	fh95 := 95.0
+	cache.recordUsage("auth-2", usageResult{
+		WeeklyPercentUsed:   95,
+		ResetAt:             now.Add(3 * time.Hour),
+		FiveHourPercentUsed: &fh95,
+		FiveHourResetAt:     now.Add(3 * time.Hour),
+		SevenDayPercentUsed: &sd18,
+		SevenDayResetAt:     now.Add(48 * time.Hour),
+	}, now)
+
+	// auth-2: 5h=95% >= 94% cutoff -> blocked on 5h
+	if !cache.isBlockedWindows("auth-2", now, 88, 94) {
+		t.Fatal("auth-2 should be blocked because 5h (95%) >= 94%")
+	}
+
+	sd90 := 90.0
+	fh20 := 20.0
+	cache.recordUsage("auth-3", usageResult{
+		WeeklyPercentUsed:   90,
+		ResetAt:             now.Add(48 * time.Hour),
+		FiveHourPercentUsed: &fh20,
+		FiveHourResetAt:     now.Add(3 * time.Hour),
+		SevenDayPercentUsed: &sd90,
+		SevenDayResetAt:     now.Add(48 * time.Hour),
+	}, now)
+
+	// auth-3: 7d=90% >= 88% cutoff -> blocked on 7d
+	if !cache.isBlockedWindows("auth-3", now, 88, 94) {
+		t.Fatal("auth-3 should be blocked because 7d (90%) >= 88%")
+	}
+}
+
+func TestCatduckDistinctCutoffsE2EScheduling(t *testing.T) {
+	now := time.Date(2026, time.October, 11, 14, 0, 0, 0, time.UTC)
+	clock := &testClock{value: now}
+
+	sevenDayReset := now.Add(48 * time.Hour)
+	fiveHourReset := now.Add(3 * time.Hour)
+
+	sd18 := 18.0
+	fh88 := 88.0
+	fh95 := 95.0
+
+	sd89 := 89.0
+	fh20 := 20.0
+
+	host := &fakeHost{
+		entries: []pluginapi.HostAuthFileEntry{
+			physicalEntry("auth-5h-blocked", "idx-1"),
+			physicalEntry("auth-eligible", "idx-2"),
+			physicalEntry("auth-7d-blocked", "idx-3"),
+		},
+		authJSON: map[string]json.RawMessage{
+			"idx-1": credentialJSON("token-1"),
+			"idx-2": credentialJSON("token-2"),
+			"idx-3": credentialJSON("token-3"),
+		},
+	}
+	fetcher := &fakeFetcher{replies: map[string][]fetchReply{
+		"token-1": {{result: usageResult{
+			WeeklyPercentUsed:   95,
+			ResetAt:             fiveHourReset,
+			FiveHourPercentUsed: &fh95,
+			FiveHourResetAt:     fiveHourReset,
+			SevenDayPercentUsed: &sd18,
+			SevenDayResetAt:     sevenDayReset,
+		}}},
+		"token-2": {{result: usageResult{
+			WeeklyPercentUsed:   88,
+			ResetAt:             fiveHourReset,
+			FiveHourPercentUsed: &fh88,
+			FiveHourResetAt:     fiveHourReset,
+			SevenDayPercentUsed: &sd18,
+			SevenDayResetAt:     sevenDayReset,
+		}}},
+		"token-3": {{result: usageResult{
+			WeeklyPercentUsed:   89,
+			ResetAt:             sevenDayReset,
+			FiveHourPercentUsed: &fh20,
+			FiveHourResetAt:     fiveHourReset,
+			SevenDayPercentUsed: &sd89,
+			SevenDayResetAt:     sevenDayReset,
+		}}},
+	}}
+
+	runtime := newPluginRuntime(host, fetcher.fetch, clock.now)
+	cfg := defaultPluginConfig()
+	cfg.CutoffPercentUsed = 88
+	cfg.FiveHourCutoffPercentUsed = 94
+	runtime.applyConfig(cfg)
+	defer runtime.shutdown()
+
+	waitFor(t, func() bool { return fetcher.callCount() == 3 })
+
+	resp, err := runtime.pick(claudeRequest(
+		candidate("auth-5h-blocked", 100),
+		candidate("auth-eligible", 50),
+		candidate("auth-7d-blocked", 10),
+	))
+	if err != nil || !resp.Handled || resp.AuthID != "auth-eligible" {
+		t.Fatalf("expected auth-eligible picked, got resp=%#v err=%#v", resp, err)
+	}
+
+	respAllBlocked, errAllBlocked := runtime.pick(claudeRequest(
+		candidate("auth-5h-blocked", 10),
+		candidate("auth-7d-blocked", 10),
+	))
+	if respAllBlocked.Handled || errAllBlocked == nil || errAllBlocked.Code != exhaustedErrorCode {
+		t.Fatalf("expected exhausted error for all blocked candidates, got resp=%#v err=%#v", respAllBlocked, errAllBlocked)
+	}
+}
+
+func TestCatduckBlockedCandidateQueuesRefreshWhenPeerSelected(t *testing.T) {
+	startedAt := time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC)
+	clock := &testClock{value: startedAt}
+	host := &fakeHost{
+		entries: []pluginapi.HostAuthFileEntry{
+			physicalEntry("auth-blocked", "index-b"),
+			physicalEntry("auth-ok", "index-ok"),
+		},
+		authJSON: map[string]json.RawMessage{
+			"index-b":  credentialJSON("token-b"),
+			"index-ok": credentialJSON("token-ok"),
+		},
+	}
+	fetcher := &fakeFetcher{replies: map[string][]fetchReply{
+		"token-b": {
+			{result: usageResult{WeeklyPercentUsed: 90, ResetAt: startedAt.Add(48 * time.Hour)}},
+			{result: usageResult{WeeklyPercentUsed: 10, ResetAt: startedAt.Add(48 * time.Hour)}},
+		},
+		"token-ok": {
+			{result: usageResult{WeeklyPercentUsed: 20, ResetAt: startedAt.Add(48 * time.Hour)}},
+			{result: usageResult{WeeklyPercentUsed: 20, ResetAt: startedAt.Add(48 * time.Hour)}},
+		},
+	}}
+	runtime := newPluginRuntime(host, fetcher.fetch, clock.now)
+	cfg := defaultPluginConfig()
+	cfg.PollInterval = 5 * time.Minute
+	cfg.BlockedRefreshInterval = 5 * time.Minute
+	runtime.applyConfig(cfg)
+	defer runtime.shutdown()
+	waitFor(t, func() bool { return fetcher.callCount() == 2 })
+
+	clock.set(startedAt.Add(6 * time.Minute))
+
+	resp, err := runtime.pick(claudeRequest(
+		candidate("auth-blocked", 100),
+		candidate("auth-ok", 10),
+	))
+	if err != nil || resp.AuthID != "auth-ok" {
+		t.Fatalf("resp = %#v, err = %#v", resp, err)
+	}
+
+	waitFor(t, func() bool { return fetcher.callCount() == 4 })
+	calls := fetcher.callTokens()
+	if len(calls) != 4 {
+		t.Fatalf("expected 4 calls, got %#v", calls)
+	}
+	hasTokenB := false
+	for _, tok := range calls[2:] {
+		if tok == "token-b" {
+			hasTokenB = true
+		}
+	}
+	if !hasTokenB {
+		t.Fatalf("expected token-b to refresh when peer was selected, calls=%#v", calls)
 	}
 }

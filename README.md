@@ -34,6 +34,7 @@ Published releases include Darwin (`amd64`, `arm64`), Linux (`amd64`, `arm64`), 
 | --- | --- | --- |
 | `protected-models` | `[claude-fable-5]` | Exact, case-insensitive model IDs governed by the cutoff. |
 | `cutoff-percent-used` | `50` | Blocks an eligible account at or above this seven-day utilization percentage. |
+| `five-hour-cutoff-percent-used` | same as cutoff | Blocks an eligible account at or above this five-hour utilization percentage. Defaults to `cutoff-percent-used`. |
 | `poll-interval` | `5m` | Minimum cache age before a protected request queues another refresh; a passed reset allows an immediate first-use refresh, with failed post-reset retries throttled from the attempt. |
 | `blocked-refresh-interval` | `6h` | Minimum time since the last sample or refresh attempt before a protected request rechecks a blocked account. `0` disables this backstop. |
 | `request-timeout` | `10s` | Timeout for the provider usage request, expressed as a Go duration. |

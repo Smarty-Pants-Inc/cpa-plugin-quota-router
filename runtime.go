@@ -171,7 +171,7 @@ func (r *pluginRuntime) queueCandidateRefresh(authID string, cfg pluginConfig, n
 		r.refreshMu.Unlock()
 		return
 	}
-	if !r.cache.claimRefresh(authID, now, cfg.CutoffPercentUsed, cfg.PollInterval, cfg.BlockedRefreshInterval) {
+	if !r.cache.claimRefreshWindows(authID, now, cfg.CutoffPercentUsed, cfg.FiveHourCutoffPercentUsed, cfg.PollInterval, cfg.BlockedRefreshInterval) {
 		r.refreshMu.Unlock()
 		return
 	}
@@ -225,13 +225,13 @@ func resetReadTimeout(cfg pluginConfig) time.Duration {
 // Report only safe categories for the fail-closed post-reset no-seat error.
 // Empty means the seat is no longer reset-pending (e.g. a fresh exhausted read).
 // Incomplete work is not evidence of a host outage, but still cannot enable it.
-func (r *pluginRuntime) resetPendingFailure(authID string, now time.Time, cutoff float64) string {
+func (r *pluginRuntime) resetPendingFailure(authID string, now time.Time, cutoff, fiveHourCutoff float64) string {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
 	_, pending := r.pendingIDs[authID]
 	_, inFlight := r.inFlightIDs[authID]
 	sample := r.cache.snapshot(authID)
-	if !sample.resetPending(now, cutoff) {
+	if !sample.resetPendingWindows(now, cutoff, fiveHourCutoff) {
 		return ""
 	}
 	if r.pendingAll || r.inFlightAll || pending || inFlight {
@@ -330,7 +330,7 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 	if err != nil {
 		if all {
 			authIDs = make(map[string]struct{})
-			for _, account := range r.cache.statuses(r.now(), cfg.CutoffPercentUsed) {
+			for _, account := range r.cache.statusesWindows(r.now(), cfg.CutoffPercentUsed, cfg.FiveHourCutoffPercentUsed) {
 				authIDs[account.ID] = struct{}{}
 			}
 		}
@@ -357,7 +357,7 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 }
 
 func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig) {
-	if r.cache.snapshot(auth.ID).resetPending(r.now(), cfg.CutoffPercentUsed) {
+	if r.cache.snapshot(auth.ID).resetPendingWindows(r.now(), cfg.CutoffPercentUsed, cfg.FiveHourCutoffPercentUsed) {
 		// Bound the fresh fetch too; pick's separate deadline also bounds a
 		// blocked host callback (the host API itself has no context argument).
 		cfg.RequestTimeout = resetReadTimeout(cfg)
@@ -393,11 +393,11 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 		}
 		return
 	}
-	r.cache.recordSuccess(auth.ID, result.WeeklyPercentUsed, result.ResetAt, r.now())
+	r.cache.recordUsage(auth.ID, result, r.now())
 	r.log("debug", "quota router quota refreshed", map[string]any{
 		"auth_id":             auth.ID,
 		"weekly_percent_used": result.WeeklyPercentUsed,
-		"blocked":             result.WeeklyPercentUsed >= cfg.CutoffPercentUsed,
+		"blocked":             r.cache.isBlockedWindows(auth.ID, r.now(), cfg.CutoffPercentUsed, cfg.FiveHourCutoffPercentUsed),
 	})
 }
 
