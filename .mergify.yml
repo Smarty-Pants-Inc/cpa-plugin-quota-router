@@ -10,6 +10,7 @@ queue_rules:
     checks_timeout: 90 min
     merge_method: merge
     queue_conditions:
+      - -check-failure = review/security  # a failed security verdict refuses admission, label or not
       - base = main
       - -draft
       - -label = hold
@@ -21,6 +22,7 @@ queue_rules:
           - check-success = review/security
       - check-success = test
     merge_conditions:
+      - -check-failure = review/security  # a failed security verdict refuses admission, label or not
       - check-success = test
 
 # The fleet's write App bots may queue (smarty-dev#735, #736, #1513): GitHub reports App bots as
