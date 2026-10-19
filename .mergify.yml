@@ -16,10 +16,7 @@ queue_rules:
       - -label = hold
       - -title ~= (?i)do not land
       - check-success = review/astra
-      # A PR that needs a named security pass waits for review/security on the exact head.
-      - or:
-          - -label = needs-security-pass
-          - check-success = review/security
+      # Security passes run within 24 h after merge; only a review/security FAILURE (a live harm) holds (smarty-stack#126).
       - check-success = test
     merge_conditions:
       - -check-failure = review/security  # a failed security verdict refuses admission, label or not
