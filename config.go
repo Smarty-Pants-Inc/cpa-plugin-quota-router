@@ -19,21 +19,30 @@ type lifecycleRequest struct {
 }
 
 type rawPluginConfig struct {
-	Enabled                *bool     `yaml:"enabled"`
-	ProtectedModels        *[]string `yaml:"protected-models"`
-	CutoffPercentUsed      *float64  `yaml:"cutoff-percent-used"`
-	PollInterval           string    `yaml:"poll-interval"`
-	BlockedRefreshInterval string    `yaml:"blocked-refresh-interval"`
-	RequestTimeout         string    `yaml:"request-timeout"`
+	Enabled                   *bool     `yaml:"enabled"`
+	ProtectedModels           *[]string `yaml:"protected-models"`
+	CutoffPercentUsed         *float64  `yaml:"cutoff-percent-used"`
+	FiveHourCutoffPercentUsed *float64  `yaml:"five-hour-cutoff-percent-used"`
+	PollInterval              string    `yaml:"poll-interval"`
+	BlockedRefreshInterval    string    `yaml:"blocked-refresh-interval"`
+	RequestTimeout            string    `yaml:"request-timeout"`
 }
 
 type pluginConfig struct {
-	Enabled                bool
-	ProtectedModels        []string
-	CutoffPercentUsed      float64
-	PollInterval           time.Duration
-	BlockedRefreshInterval time.Duration
-	RequestTimeout         time.Duration
+	Enabled                   bool
+	ProtectedModels           []string
+	CutoffPercentUsed         float64
+	FiveHourCutoffPercentUsed float64
+	PollInterval              time.Duration
+	BlockedRefreshInterval    time.Duration
+	RequestTimeout            time.Duration
+}
+
+func (c pluginConfig) effectiveFiveHourCutoff() float64 {
+	if c.FiveHourCutoffPercentUsed <= 0 {
+		return c.CutoffPercentUsed
+	}
+	return c.FiveHourCutoffPercentUsed
 }
 
 type registration struct {
@@ -58,12 +67,13 @@ type managementRoute struct {
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
-		Enabled:                true,
-		ProtectedModels:        []string{defaultProtectedModel},
-		CutoffPercentUsed:      defaultCutoffPercentUsed,
-		PollInterval:           defaultPollInterval,
-		BlockedRefreshInterval: defaultBlockedRefreshInterval,
-		RequestTimeout:         defaultRequestTimeout,
+		Enabled:                   true,
+		ProtectedModels:           []string{defaultProtectedModel},
+		CutoffPercentUsed:         defaultCutoffPercentUsed,
+		FiveHourCutoffPercentUsed: 0,
+		PollInterval:              defaultPollInterval,
+		BlockedRefreshInterval:    defaultBlockedRefreshInterval,
+		RequestTimeout:            defaultRequestTimeout,
 	}
 }
 
@@ -94,6 +104,10 @@ func decodeLifecycleConfig(raw []byte) (pluginConfig, error) {
 	}
 	if decoded.CutoffPercentUsed != nil {
 		cfg.CutoffPercentUsed = *decoded.CutoffPercentUsed
+		cfg.FiveHourCutoffPercentUsed = *decoded.CutoffPercentUsed
+	}
+	if decoded.FiveHourCutoffPercentUsed != nil {
+		cfg.FiveHourCutoffPercentUsed = *decoded.FiveHourCutoffPercentUsed
 	}
 	if value := strings.TrimSpace(decoded.PollInterval); value != "" {
 		interval, err := time.ParseDuration(value)
@@ -118,6 +132,9 @@ func decodeLifecycleConfig(raw []byte) (pluginConfig, error) {
 	}
 	if math.IsNaN(cfg.CutoffPercentUsed) || math.IsInf(cfg.CutoffPercentUsed, 0) || cfg.CutoffPercentUsed < 0 || cfg.CutoffPercentUsed > 100 {
 		return pluginConfig{}, fmt.Errorf("cutoff-percent-used must be between 0 and 100")
+	}
+	if math.IsNaN(cfg.FiveHourCutoffPercentUsed) || math.IsInf(cfg.FiveHourCutoffPercentUsed, 0) || cfg.FiveHourCutoffPercentUsed < 0 || cfg.FiveHourCutoffPercentUsed > 100 {
+		return pluginConfig{}, fmt.Errorf("five-hour-cutoff-percent-used must be between 0 and 100")
 	}
 	if cfg.PollInterval <= 0 {
 		return pluginConfig{}, fmt.Errorf("poll-interval must be greater than zero")
@@ -177,6 +194,11 @@ func pluginRegistration() registration {
 					Name:        "cutoff-percent-used",
 					Type:        pluginapi.ConfigFieldTypeNumber,
 					Description: "Blocks a Claude auth when seven_day utilization reaches this percent used. Default: 50.",
+				},
+				{
+					Name:        "five-hour-cutoff-percent-used",
+					Type:        pluginapi.ConfigFieldTypeNumber,
+					Description: "Blocks a Claude auth when five_hour utilization reaches this percent used. Defaults to cutoff-percent-used.",
 				},
 				{
 					Name:        "poll-interval",

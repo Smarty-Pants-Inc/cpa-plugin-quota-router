@@ -73,11 +73,11 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 		}
 		claudeCandidates++
 		sample := r.cache.snapshot(candidate.ID)
-		if sample.resetPending(now, cfg.CutoffPercentUsed) {
+		if sample.resetPendingWindows(now, cfg.CutoffPercentUsed, cfg.effectiveFiveHourCutoff()) {
 			resetPending = append(resetPending, candidate)
 			continue
 		}
-		if sample.blocked(now, cfg.CutoffPercentUsed) {
+		if sample.blockedWindows(now, cfg.CutoffPercentUsed, cfg.effectiveFiveHourCutoff()) {
 			r.queueCandidateRefresh(candidate.ID, cfg, now)
 			continue
 		}
@@ -101,24 +101,21 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 		now = r.now()
 		for _, candidate := range resetPending {
 			sample := r.cache.snapshot(candidate.ID)
-			if sample.HasSample && sample.WeeklyPercentUsed < cfg.CutoffPercentUsed {
+			if sample.HasSample && !sample.blockedWindows(now, cfg.CutoffPercentUsed, cfg.effectiveFiveHourCutoff()) {
 				selected = preferredCandidate(selected, candidate)
 			}
 		}
 		if selected != nil {
 			return pluginapi.SchedulerPickResponse{AuthID: selected.ID, Handled: true}, nil
 		}
-
-		// Fail closed: all seats being reset-pending while the quota host is
-		// down is a narrow window because accounts reset at different times.
-		// An unverified post-reset seat must never be used, even in an outage.
-		// Reuse the existing typed no-seat path; successful exhausted reads
+		// When all candidates were reset-pending and none cleared below the
+		// cutoff, return the host error that prevented the read. Callers then
 		// retain the normal exhausted error below, never becoming eligible.
 		if len(resetPending) == claudeCandidates {
 			failures := make(map[string]string, len(ids))
 			categories := make(map[string]struct{})
 			for _, candidate := range resetPending {
-				category := r.resetPendingFailure(candidate.ID, now, cfg.CutoffPercentUsed)
+				category := r.resetPendingFailure(candidate.ID, now, cfg.CutoffPercentUsed, cfg.effectiveFiveHourCutoff())
 				if category == "" {
 					break
 				}
@@ -170,12 +167,21 @@ func isClaudeRequest(req pluginapi.SchedulerPickRequest) bool {
 }
 
 func isProtectedModel(model string, protectedModels []string) bool {
-	model = strings.TrimSpace(model)
+	model = strings.ToLower(strings.TrimSpace(model))
 	if model == "" {
 		return false
 	}
 	for _, protectedModel := range protectedModels {
-		if strings.EqualFold(model, protectedModel) {
+		protectedModel = strings.ToLower(strings.TrimSpace(protectedModel))
+		if protectedModel == "*" {
+			return true
+		}
+		if strings.HasSuffix(protectedModel, "*") {
+			prefix := strings.TrimSuffix(protectedModel, "*")
+			if strings.HasPrefix(model, prefix) {
+				return true
+			}
+		} else if protectedModel == model {
 			return true
 		}
 	}
@@ -193,10 +199,11 @@ func (r *pluginRuntime) handleManagement(req pluginapi.ManagementRequest) plugin
 	}
 	cfg := r.loadedConfig()
 	body, _ := json.Marshal(cutoffStatusResponse{
-		Enabled:           cfg.Enabled,
-		CutoffPercentUsed: cfg.CutoffPercentUsed,
-		ProtectedModels:   cfg.ProtectedModels,
-		Accounts:          r.cache.statuses(r.now(), cfg.CutoffPercentUsed),
+		Enabled:                   cfg.Enabled,
+		CutoffPercentUsed:         cfg.CutoffPercentUsed,
+		FiveHourCutoffPercentUsed: cfg.effectiveFiveHourCutoff(),
+		ProtectedModels:           cfg.ProtectedModels,
+		Accounts:                  r.cache.statusesWindows(r.now(), cfg.CutoffPercentUsed, cfg.effectiveFiveHourCutoff()),
 	})
 	return pluginapi.ManagementResponse{
 		StatusCode: http.StatusOK,
